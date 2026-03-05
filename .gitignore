@@ -1,0 +1,6 @@
+/vectorscan
+/vectorscan-test
+*.exe
+*.test
+*.out
+.DS_Store

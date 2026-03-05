@@ -1,0 +1,891 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VectorScan Security Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"></script>
+    <style>
+        :root {
+            --bg-primary: #0d1117;
+            --bg-card: #161b22;
+            --text-primary: #c9d1d9;
+            --text-secondary: #8b949e;
+            --border-color: #30363d;
+            --critical: #f85149;
+            --high: #d29922;
+            --medium: #e3b341;
+            --low: #3fb950;
+            --info: #58a6ff;
+            --enabled: #bc8cff;
+            --accent: #238636;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            line-height: 1.5;
+        }
+
+        /* Header */
+        header {
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            background-color: var(--bg-card);
+            border-bottom: 1px solid var(--border-color);
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .header-title {
+            font-size: 18px;
+            font-weight: 600;
+            white-space: nowrap;
+        }
+
+        .header-meta {
+            display: flex;
+            gap: 20px;
+            font-size: 12px;
+            color: var(--text-secondary);
+            flex: 1;
+            min-width: 0;
+            flex-wrap: wrap;
+        }
+
+        .meta-item {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .header-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        button {
+            padding: 6px 12px;
+            background-color: var(--accent);
+            color: white;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            transition: background-color 0.2s;
+        }
+
+        button:hover {
+            background-color: #2ea043;
+        }
+
+        button:active {
+            background-color: #238636;
+        }
+
+        /* Main container */
+        .container {
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        /* KPI Cards */
+        .kpi-section {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+            margin-bottom: 24px;
+        }
+
+        .kpi-card {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            text-align: center;
+            border-left: 4px solid;
+        }
+
+        .kpi-card.critical { border-left-color: var(--critical); }
+        .kpi-card.high { border-left-color: var(--high); }
+        .kpi-card.medium { border-left-color: var(--medium); }
+        .kpi-card.low { border-left-color: var(--low); }
+        .kpi-card.info { border-left-color: var(--info); }
+        .kpi-card.enabled { border-left-color: var(--enabled); }
+
+        .kpi-label {
+            font-size: 12px;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+
+        .kpi-value {
+            font-size: 28px;
+            font-weight: 700;
+            display: inline-block;
+            min-width: 50px;
+        }
+
+        .critical .kpi-value { color: var(--critical); }
+        .high .kpi-value { color: var(--high); }
+        .medium .kpi-value { color: var(--medium); }
+        .low .kpi-value { color: var(--low); }
+        .info .kpi-value { color: var(--info); }
+        .enabled .kpi-value { color: var(--enabled); }
+
+        /* Charts section */
+        .charts-section {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .chart-container {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            position: relative;
+        }
+
+        .chart-title {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 16px;
+            color: var(--text-primary);
+        }
+
+        #scoreGauge {
+            max-width: 200px;
+            margin: 0 auto;
+        }
+
+        /* Table section */
+        .table-section {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .table-toolbar {
+            display: flex;
+            gap: 12px;
+            padding: 16px;
+            border-bottom: 1px solid var(--border-color);
+            flex-wrap: wrap;
+            align-items: center;
+        }
+
+        .search-input, .filter-select {
+            background-color: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+        }
+
+        .search-input::placeholder {
+            color: var(--text-secondary);
+        }
+
+        .table-info {
+            margin-left: auto;
+            font-size: 12px;
+            color: var(--text-secondary);
+            white-space: nowrap;
+        }
+
+        .table-wrapper {
+            max-height: 600px;
+            overflow-y: auto;
+            overflow-x: auto;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+
+        thead {
+            position: sticky;
+            top: 0;
+            background-color: var(--bg-primary);
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        th {
+            padding: 12px 16px;
+            text-align: left;
+            font-weight: 600;
+            color: var(--text-primary);
+            cursor: pointer;
+            user-select: none;
+            white-space: nowrap;
+        }
+
+        th:hover {
+            background-color: var(--border-color);
+        }
+
+        .sort-indicator {
+            font-size: 10px;
+            margin-left: 4px;
+            opacity: 0.5;
+        }
+
+        td {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        tbody tr {
+            border-left: 3px solid transparent;
+            transition: background-color 0.15s;
+        }
+
+        tbody tr:hover {
+            background-color: var(--border-color);
+        }
+
+        tr.critical { border-left-color: var(--critical); }
+        tr.high { border-left-color: var(--high); }
+        tr.medium { border-left-color: var(--medium); }
+        tr.low { border-left-color: var(--low); }
+        tr.info { border-left-color: var(--info); }
+
+        .severity-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .severity-critical { background-color: rgba(248, 81, 73, 0.15); color: var(--critical); }
+        .severity-high { background-color: rgba(210, 153, 34, 0.15); color: var(--high); }
+        .severity-medium { background-color: rgba(227, 179, 65, 0.15); color: var(--medium); }
+        .severity-low { background-color: rgba(63, 185, 80, 0.15); color: var(--low); }
+        .severity-info { background-color: rgba(88, 166, 255, 0.15); color: var(--info); }
+
+        .expand-toggle {
+            cursor: pointer;
+            user-select: none;
+            display: inline-block;
+            width: 16px;
+        }
+
+        .detail-row {
+            display: none;
+        }
+
+        .detail-row.expanded {
+            display: table-row;
+        }
+
+        .detail-cell {
+            padding: 16px !important;
+        }
+
+        .detail-content {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        .detail-field {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .detail-label {
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-secondary);
+            font-weight: 600;
+        }
+
+        .detail-value {
+            color: var(--text-primary);
+        }
+
+        .evidence-code {
+            background-color: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 8px 12px;
+            font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
+            font-size: 12px;
+            overflow-x: auto;
+            margin-bottom: 8px;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .container {
+                padding: 16px;
+            }
+
+            header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 12px;
+            }
+
+            .header-meta {
+                width: 100%;
+                flex-direction: column;
+                gap: 8px;
+            }
+
+            .header-actions {
+                width: 100%;
+                justify-content: flex-start;
+            }
+
+            .charts-section {
+                grid-template-columns: 1fr;
+            }
+
+            .detail-content {
+                grid-template-columns: 1fr;
+            }
+
+            .table-toolbar {
+                flex-direction: column;
+            }
+
+            .table-info {
+                margin-left: 0;
+            }
+        }
+
+        /* Print styles */
+        @media print {
+            header .header-actions {
+                display: none;
+            }
+
+            body {
+                background-color: white;
+                color: black;
+            }
+
+            .chart-container, .table-section {
+                background-color: white;
+                border-color: #ccc;
+                page-break-inside: avoid;
+            }
+
+            .detail-row {
+                display: table-row !important;
+            }
+
+            th, td {
+                border-color: #ccc;
+            }
+
+            .severity-badge {
+                border: 1px solid black;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="header-title">VectorScan v1.0.0</div>
+        <div class="header-meta">
+            <div class="meta-item"><strong>Host:</strong> <span id="metaHostname">-</span></div>
+            <div class="meta-item"><strong>Platform:</strong> <span id="metaPlatform">-</span></div>
+            <div class="meta-item"><strong>OS:</strong> <span id="metaOS">-</span></div>
+            <div class="meta-item"><strong>Date:</strong> <span id="metaDate">-</span></div>
+            <div class="meta-item"><strong>Duration:</strong> <span id="metaDuration">-</span></div>
+        </div>
+        <div class="header-actions">
+            <button onclick="exportPDF()">📄 PDF</button>
+            <button onclick="exportCSV()">📊 CSV</button>
+            <button onclick="exportJSON()">⚙️ JSON</button>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- KPI Cards -->
+        <div class="kpi-section">
+            <div class="kpi-card critical">
+                <div class="kpi-label">Critical</div>
+                <div class="kpi-value" id="kpiCritical">0</div>
+            </div>
+            <div class="kpi-card high">
+                <div class="kpi-label">High</div>
+                <div class="kpi-value" id="kpiHigh">0</div>
+            </div>
+            <div class="kpi-card medium">
+                <div class="kpi-label">Medium</div>
+                <div class="kpi-value" id="kpiMedium">0</div>
+            </div>
+            <div class="kpi-card low">
+                <div class="kpi-label">Low</div>
+                <div class="kpi-value" id="kpiLow">0</div>
+            </div>
+            <div class="kpi-card info">
+                <div class="kpi-label">Info</div>
+                <div class="kpi-value" id="kpiInfo">0</div>
+            </div>
+            <div class="kpi-card enabled">
+                <div class="kpi-label">Enabled</div>
+                <div class="kpi-value" id="kpiEnabled">0</div>
+            </div>
+        </div>
+
+        <!-- Charts -->
+        <div class="charts-section">
+            <div class="chart-container">
+                <div class="chart-title">Security Score</div>
+                <canvas id="scoreGauge"></canvas>
+            </div>
+            <div class="chart-container">
+                <div class="chart-title">Severity Distribution</div>
+                <canvas id="severityChart"></canvas>
+            </div>
+            <div class="chart-container">
+                <div class="chart-title">Findings by Category</div>
+                <canvas id="categoryChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Findings Table -->
+        <div class="table-section">
+            <div class="table-toolbar">
+                <input type="text" class="search-input" id="searchInput" placeholder="🔍 Search findings...">
+                <select class="filter-select" id="severityFilter">
+                    <option value="">All Severities</option>
+                    <option value="CRITICAL">Critical</option>
+                    <option value="HIGH">High</option>
+                    <option value="MEDIUM">Medium</option>
+                    <option value="LOW">Low</option>
+                    <option value="INFO">Info</option>
+                </select>
+                <select class="filter-select" id="categoryFilter">
+                    <option value="">All Categories</option>
+                </select>
+                <div class="table-info">Showing <span id="tableShowing">0</span> of <span id="tableTotal">0</span> findings</div>
+            </div>
+            <div class="table-wrapper">
+                <table>
+                    <thead>
+                        <tr>
+                            <th onclick="toggleSort('id')" style="width: 80px;">ID <span class="sort-indicator" id="sort-id"></span></th>
+                            <th onclick="toggleSort('severity')" style="width: 90px;">Severity <span class="sort-indicator" id="sort-severity"></span></th>
+                            <th onclick="toggleSort('category')" style="width: 100px;">Category <span class="sort-indicator" id="sort-category"></span></th>
+                            <th onclick="toggleSort('title')">Title <span class="sort-indicator" id="sort-title"></span></th>
+                            <th onclick="toggleSort('timestamp')" style="width: 140px;">Time <span class="sort-indicator" id="sort-timestamp"></span></th>
+                        </tr>
+                    </thead>
+                    <tbody id="findingsTable">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let window.__reportData = null;
+        let window.__filteredFindings = [];
+        let window.__sortColumn = 'timestamp';
+        let window.__sortAsc = false;
+
+        // Initialize on page load
+        async function init() {
+            try {
+                await loadReport();
+                populateMetadata();
+                updateKPIs();
+                drawGauge();
+                populateCategoryFilter();
+                initSeverityChart();
+                initCategoryChart();
+                renderTable();
+                attachEventListeners();
+            } catch (err) {
+                console.error('Dashboard error:', err);
+                document.body.innerHTML = '<div style="color: red; padding: 20px;">Failed to load report: ' + err.message + '</div>';
+            }
+        }
+
+        async function loadReport() {
+            const response = await fetch('/api/report');
+            if (!response.ok) throw new Error('Failed to load report: ' + response.status);
+            window.__reportData = await response.json();
+            window.__filteredFindings = [...window.__reportData.findings];
+        }
+
+        function populateMetadata() {
+            const data = window.__reportData;
+            const scanDate = new Date(data.scan_date);
+            document.getElementById('metaHostname').textContent = data.hostname || '-';
+            document.getElementById('metaPlatform').textContent = data.platform || '-';
+            document.getElementById('metaOS').textContent = data.os_version || '-';
+            document.getElementById('metaDate').textContent = scanDate.toLocaleString();
+            document.getElementById('metaDuration').textContent = calculateDuration();
+        }
+
+        function calculateDuration() {
+            const data = window.__reportData;
+            if (!data.scan_date) return '-';
+            // For display, estimate duration from findings timestamp if available
+            if (data.findings.length > 0) {
+                const first = new Date(data.findings[0].timestamp);
+                const last = new Date(data.findings[data.findings.length - 1].timestamp);
+                const ms = Math.abs(last - first) || 1000;
+                return formatDuration(ms);
+            }
+            return '-';
+        }
+
+        function formatDuration(ms) {
+            if (ms < 1000) return Math.round(ms) + 'ms';
+            if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+            return (ms / 60000).toFixed(1) + 'm';
+        }
+
+        function updateKPIs() {
+            const data = window.__reportData;
+            animateCount('kpiCritical', data.critical);
+            animateCount('kpiHigh', data.high);
+            animateCount('kpiMedium', data.medium);
+            animateCount('kpiLow', data.low);
+            animateCount('kpiInfo', data.info);
+            animateCount('kpiEnabled', data.enabled);
+        }
+
+        function animateCount(elementId, target) {
+            const el = document.getElementById(elementId);
+            let current = 0;
+            const increment = Math.max(1, Math.ceil(target / 20));
+            const interval = setInterval(() => {
+                current += increment;
+                if (current >= target) {
+                    el.textContent = target;
+                    clearInterval(interval);
+                } else {
+                    el.textContent = current;
+                }
+            }, 30);
+        }
+
+        function drawGauge() {
+            const score = window.__reportData.security_score;
+            const canvas = document.getElementById('scoreGauge');
+            const ctx = canvas.getContext('2d');
+            const size = Math.min(180, canvas.offsetWidth - 20);
+            canvas.width = size;
+            canvas.height = size;
+
+            const centerX = size / 2;
+            const centerY = size / 2;
+            const radius = size / 2 - 10;
+
+            // Draw background arc
+            ctx.strokeStyle = '#30363d';
+            ctx.lineWidth = 10;
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+            ctx.stroke();
+
+            // Draw score arc with gradient
+            const startAngle = -Math.PI / 2;
+            const endAngle = startAngle + (score / 100) * Math.PI * 2;
+
+            const gradient = ctx.createLinearGradient(centerX - radius, centerY, centerX + radius, centerY);
+            gradient.addColorStop(0, '#f85149');
+            gradient.addColorStop(0.33, '#d29922');
+            gradient.addColorStop(0.66, '#e3b341');
+            gradient.addColorStop(1, '#3fb950');
+
+            ctx.strokeStyle = gradient;
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, radius, startAngle, endAngle);
+            ctx.stroke();
+
+            // Draw center text
+            ctx.fillStyle = '#c9d1d9';
+            ctx.font = 'bold 32px -apple-system, BlinkMacSystemFont, "Segoe UI"';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(score, centerX, centerY - 10);
+
+            ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI"';
+            ctx.fillStyle = '#8b949e';
+            ctx.fillText('Security Score', centerX, centerY + 20);
+        }
+
+        function populateCategoryFilter() {
+            const categories = [...new Set(window.__reportData.findings.map(f => f.category))];
+            categories.sort();
+            const select = document.getElementById('categoryFilter');
+            categories.forEach(cat => {
+                const option = document.createElement('option');
+                option.value = cat;
+                option.textContent = cat.charAt(0).toUpperCase() + cat.slice(1);
+                select.appendChild(option);
+            });
+        }
+
+        function initSeverityChart() {
+            if (typeof Chart === 'undefined') {
+                console.warn('Chart.js not loaded');
+                return;
+            }
+
+            const data = window.__reportData;
+            const ctx = document.getElementById('severityChart').getContext('2d');
+            new Chart(ctx, {
+                type: 'doughnut',
+                data: {
+                    labels: ['Critical', 'High', 'Medium', 'Low', 'Info'],
+                    datasets: [{
+                        data: [data.critical, data.high, data.medium, data.low, data.info],
+                        backgroundColor: ['#f85149', '#d29922', '#e3b341', '#3fb950', '#58a6ff'],
+                        borderColor: '#161b22',
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: {
+                            position: 'right',
+                            labels: { color: '#c9d1d9', font: { size: 12 }, padding: 12 }
+                        }
+                    }
+                }
+            });
+        }
+
+        function initCategoryChart() {
+            if (typeof Chart === 'undefined') {
+                console.warn('Chart.js not loaded');
+                return;
+            }
+
+            const categories = {};
+            window.__reportData.findings.forEach(f => {
+                categories[f.category] = (categories[f.category] || 0) + 1;
+            });
+
+            const sortedCats = Object.entries(categories).sort((a, b) => b[1] - a[1]);
+            const labels = sortedCats.map(([cat]) => cat.charAt(0).toUpperCase() + cat.slice(1));
+            const counts = sortedCats.map(([, count]) => count);
+
+            const ctx = document.getElementById('categoryChart').getContext('2d');
+            new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: 'Findings',
+                        data: counts,
+                        backgroundColor: '#58a6ff',
+                        borderColor: '#238636',
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    indexAxis: 'y',
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    plugins: {
+                        legend: { display: false }
+                    },
+                    scales: {
+                        x: {
+                            ticks: { color: '#8b949e' },
+                            grid: { color: '#30363d' }
+                        },
+                        y: {
+                            ticks: { color: '#8b949e' }
+                        }
+                    }
+                }
+            });
+        }
+
+        function renderTable() {
+            const tbody = document.getElementById('findingsTable');
+            tbody.innerHTML = '';
+
+            window.__filteredFindings.forEach((f, idx) => {
+                // Main row
+                const tr = document.createElement('tr');
+                tr.className = f.severity.toLowerCase();
+                tr.innerHTML = `
+                    <td><span class="expand-toggle" onclick="toggleRow(${idx})">▶</span> ${f.id}</td>
+                    <td><span class="severity-badge severity-${f.severity.toLowerCase()}">${f.severity}</span></td>
+                    <td>${f.category}</td>
+                    <td>${f.title}</td>
+                    <td>${new Date(f.timestamp).toLocaleString()}</td>
+                `;
+                tr.onclick = (e) => { if (e.target.closest('button') === null) toggleRow(idx); };
+                tbody.appendChild(tr);
+
+                // Detail row
+                const detailTr = document.createElement('tr');
+                detailTr.className = `detail-row ${f.severity.toLowerCase()}`;
+                detailTr.id = `detail-${idx}`;
+                detailTr.innerHTML = `
+                    <td colspan="5" class="detail-cell">
+                        <div class="detail-content">
+                            <div class="detail-field">
+                                <div class="detail-label">Description</div>
+                                <div class="detail-value">${f.description}</div>
+                            </div>
+                            <div class="detail-field">
+                                <div class="detail-label">Remediation</div>
+                                <div class="detail-value">${f.remediation}</div>
+                            </div>
+                        </div>
+                        <div class="detail-field" style="margin-top: 16px;">
+                            <div class="detail-label">Evidence</div>
+                            ${f.evidence.map(e => `<div class="evidence-code">${escapeHtml(e)}</div>`).join('')}
+                        </div>
+                    </td>
+                `;
+                tbody.appendChild(detailTr);
+            });
+
+            document.getElementById('tableShowing').textContent = window.__filteredFindings.length;
+            document.getElementById('tableTotal').textContent = window.__reportData.findings.length;
+        }
+
+        function toggleRow(idx) {
+            const detail = document.getElementById(`detail-${idx}`);
+            if (detail) {
+                detail.classList.toggle('expanded');
+            }
+        }
+
+        function escapeHtml(text) {
+            const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
+            return text.replace(/[&<>"']/g, m => map[m]);
+        }
+
+        function toggleSort(column) {
+            const indicators = document.querySelectorAll('.sort-indicator');
+            indicators.forEach(el => el.textContent = '');
+
+            if (window.__sortColumn === column) {
+                window.__sortAsc = !window.__sortAsc;
+            } else {
+                window.__sortColumn = column;
+                window.__sortAsc = true;
+            }
+
+            window.__filteredFindings.sort((a, b) => {
+                let aVal = a[column];
+                let bVal = b[column];
+                if (column === 'timestamp') {
+                    aVal = new Date(aVal);
+                    bVal = new Date(bVal);
+                }
+                const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+                return window.__sortAsc ? cmp : -cmp;
+            });
+
+            document.getElementById(`sort-${column}`).textContent = window.__sortAsc ? '▲' : '▼';
+            renderTable();
+        }
+
+        function applyFilters() {
+            const search = document.getElementById('searchInput').value.toLowerCase();
+            const severity = document.getElementById('severityFilter').value;
+            const category = document.getElementById('categoryFilter').value;
+
+            window.__filteredFindings = window.__reportData.findings.filter(f => {
+                const matchSearch = !search || f.title.toLowerCase().includes(search) ||
+                                   f.description.toLowerCase().includes(search) ||
+                                   f.id.toLowerCase().includes(search);
+                const matchSeverity = !severity || f.severity === severity;
+                const matchCategory = !category || f.category === category;
+                return matchSearch && matchSeverity && matchCategory;
+            });
+
+            renderTable();
+        }
+
+        function attachEventListeners() {
+            document.getElementById('searchInput').addEventListener('input', applyFilters);
+            document.getElementById('severityFilter').addEventListener('change', applyFilters);
+            document.getElementById('categoryFilter').addEventListener('change', applyFilters);
+        }
+
+        function exportCSV() {
+            const headers = ['ID', 'Category', 'Severity', 'Title', 'Description', 'Remediation', 'Evidence', 'Timestamp'];
+            const rows = window.__reportData.findings.map(f => [
+                f.id,
+                f.category,
+                f.severity,
+                f.title,
+                f.description,
+                f.remediation,
+                f.evidence.join('; '),
+                f.timestamp
+            ]);
+
+            let csv = headers.join(',') + '\n';
+            rows.forEach(row => {
+                csv += row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',') + '\n';
+            });
+
+            const blob = new Blob([csv], { type: 'text/csv' });
+            downloadBlob(blob, 'vectorscan-report.csv');
+        }
+
+        function exportJSON() {
+            const json = JSON.stringify(window.__reportData, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            downloadBlob(blob, 'vectorscan-report.json');
+        }
+
+        function downloadBlob(blob, filename) {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        function exportPDF() {
+            window.print();
+        }
+
+        // Start the app
+        init();
+    </script>
+</body>
+</html>

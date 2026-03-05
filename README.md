@@ -1,0 +1,122 @@
+# vectorscan
+
+```
+  ██╗   ██╗███████╗ ██████╗████████╗ ██████╗ ██████╗ ███████╗ ██████╗ █████╗ ███╗   ██╗
+  ██║   ██║██╔════╝██╔════╝╚══██╔══╝██╔═══██╗██╔══██╗██╔════╝██╔════╝██╔══██╗████╗  ██║
+  ██║   ██║█████╗  ██║        ██║   ██║   ██║██████╔╝███████╗██║     ███████║██╔██╗ ██║
+  ╚██╗ ██╔╝██╔══╝  ██║        ██║   ██║   ██║██╔══██╗╚════██║██║     ██╔══██║██║╚██╗██║
+   ╚████╔╝ ███████╗╚██████╗   ██║   ╚██████╔╝██║  ██║███████║╚██████╗██║  ██║██║ ╚████║
+    ╚═══╝  ╚══════╝ ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝
+```
+
+> Don't trust the government. Big brother is always watching. Question everything.
+
+Fast, opinionated system security audit tool. Scans your Mac for misconfigurations, weak defaults, and attack vectors — then tells you exactly what to fix. No agents, no cloud, no telemetry. Just a binary and the truth.
+
+Currently macOS only. Linux and Windows support coming soon.
+
+```
+$ sudo ./vectorscan
+
+  ╔══════════════════════════════════════════════════════════╗
+  ║            VECTORSCAN — System Security Audit            ║
+  ╚══════════════════════════════════════════════════════════╝
+  Don't trust the government. Big brother is always watching. Question everything.
+
+  [========================================] 100% (62/62) Firmware updates
+
+  ┌─ Security Score ─────────────────────────────────────────┐
+  │ ████████░░ [83%] Good (75%+ checks passing)
+  │ 34 of 55 checks passing | 184/220 points
+  └──────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Quick start
+
+```bash
+# Build
+go build -o vectorscan ./cmd/vectorscan/
+
+# Run (some checks need root for full accuracy)
+sudo ./vectorscan
+
+# Without root (partial results, warns you)
+./vectorscan
+```
+
+---
+
+## Output formats
+
+```bash
+./vectorscan                    # Table (default) — colored terminal output
+./vectorscan -output json       # JSON — pipe to jq, feed to dashboards
+./vectorscan -output csv        # CSV — spreadsheets, compliance reports
+./vectorscan -output markdown   # Markdown — paste into docs or tickets
+```
+
+---
+
+## What it checks
+
+62 security checks across these categories:
+
+| Category | What it covers |
+|----------|---------------|
+| **Permissions** | Sudoers, world-writable files, SUID binaries |
+| **System** | SIP, Gatekeeper, FileVault, XProtect, firmware, secure boot |
+| **Authentication** | Password policy, account lockout, empty passwords, Touch ID for sudo |
+| **Network** | Open ports, SSH config, VPN, DNS-over-HTTPS, DNSSEC, Bonjour, weak ciphers |
+| **Privacy** | Spotlight telemetry, Siri analytics, Apple analytics, camera/mic access, location services |
+| **Persistence** | Launch agents, shell configs, kernel extensions |
+| **Logging** | Audit daemon, syslog, crash reporter, log retention |
+| **Credentials** | Exposed credential files, git config secrets, SSH key strength |
+
+---
+
+## Scoring
+
+Weighted scoring — critical issues hurt more than low ones. Skipped checks (timeouts, insufficient privileges) are excluded from the score entirely.
+
+| Severity | Weight | Meaning |
+|----------|--------|---------|
+| CRITICAL | 4 pts | Immediate risk — fix now |
+| HIGH | 3 pts | Significant exposure — fix soon |
+| MEDIUM | 2 pts | Weak configuration — should address |
+| LOW | 1 pt | Hardening opportunity |
+| INFO | 0 pts | Informational / passing check |
+
+Every check is worth 4 points max. Passing checks earn full points. Failing checks lose points based on severity. Your score is `earned / max * 100`.
+
+```
+3 critical findings: -12 pts
+2 high findings:     -6 pts
+9 medium findings:   -18 pts
+4 low findings:      -4 pts
+                     ─────
+Total deductions:    -40 pts
+Max possible:        220 pts
+Earned:              180 pts → 81%
+```
+
+---
+
+## What you need
+
+- macOS (darwin)
+- Go 1.21+
+- 7 seconds
+
+---
+
+## License
+
+MIT — free for everyone, forever. Use it, fork it, modify it, share it.
+
+---
+
+*Know your attack surface. Fix it before someone else finds it.*
+
+— [linkvectorized](https://github.com/linkvectorized)
