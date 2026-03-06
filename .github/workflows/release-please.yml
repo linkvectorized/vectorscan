@@ -20,6 +20,7 @@ jobs:
         id: release
         with:
           release-type: go
+          automerge: true
 
   build:
     needs: release-please
