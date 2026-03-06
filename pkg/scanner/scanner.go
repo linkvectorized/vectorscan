@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/linkvectorized/vectorscan/pkg/models"
@@ -13,10 +15,11 @@ import (
 
 // Scanner orchestrates security checks
 type Scanner struct {
-	platform string
-	report   *models.Report
-	platform_util platform.Platform
-	progressChan chan ProgressUpdate
+	platform       string
+	osMajorVersion int // parsed from sw_vers, e.g. 14, 15, 26
+	report         *models.Report
+	platform_util  platform.Platform
+	progressChan   chan ProgressUpdate
 }
 
 // ProgressUpdate reports scan progress
@@ -38,18 +41,36 @@ func New() (*Scanner, error) {
 	hostname, _ := os.Hostname()
 
 	s := &Scanner{
-		platform: plat,
+		platform:      plat,
 		platform_util: pu,
-		progressChan: make(chan ProgressUpdate, 100),
+		progressChan:  make(chan ProgressUpdate, 100),
 		report: &models.Report{
-			Hostname:  hostname,
-			Platform:  plat,
-			ScanDate:  time.Now(),
-			Findings:  []models.Finding{},
+			Hostname: hostname,
+			Platform: plat,
+			ScanDate: time.Now(),
+			Findings: []models.Finding{},
 		},
 	}
 
+	// Parse OS major version for version-gated checks
+	if ver, err := pu.GetOSVersion(); err == nil {
+		parts := strings.Split(ver, ".")
+		if len(parts) > 0 {
+			major, _ := strconv.Atoi(parts[0])
+			s.osMajorVersion = major
+		}
+	}
+
 	return s, nil
+}
+
+// systemSettings returns the correct system settings app name for the current OS version.
+// macOS 13 Ventura+ renamed "System Preferences" to "System Settings".
+func (s *Scanner) systemSettings() string {
+	if s.osMajorVersion >= 13 {
+		return "System Settings"
+	}
+	return "System Preferences"
 }
 
 // ProgressChan returns the progress update channel

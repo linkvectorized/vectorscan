@@ -91,6 +91,9 @@ func (r *Report) Summarize() {
 	r.Enabled = 0
 
 	for _, f := range r.Findings {
+		if f.Skipped {
+			continue // Skipped findings don't count as issues or passing checks
+		}
 		if f.Passed {
 			r.Enabled++
 			continue

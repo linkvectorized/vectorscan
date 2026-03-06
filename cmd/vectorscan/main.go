@@ -198,8 +198,9 @@ func displayProgressBar(current, total int, checkName, spinner string) {
 }
 
 func truncate(s string, maxLen int) string {
-	if len(s) > maxLen {
-		return s[:maxLen-3] + "..."
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		return string(runes[:maxLen-3]) + "..."
 	}
 	return s
 }

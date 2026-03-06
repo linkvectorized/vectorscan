@@ -3,7 +3,6 @@ package scanner
 import (
 	"context"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -212,30 +211,28 @@ func (s *Scanner) checkGatekeeper(ctx context.Context) (*models.Finding, error) 
 
 // checkFirewall checks firewall status on macOS
 func (s *Scanner) checkFirewall(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read /Library/Preferences/com.apple.alf globalstate")
-	if err != nil {
+	// Use socketfilterfw (the proper API) instead of defaults read (known to hang)
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null")
+	if err != nil || strings.TrimSpace(output) == "" {
 		return nil, nil
 	}
 
-	trimmedOutput := strings.TrimSpace(output)
-
-	// 0 = off, 1 = on for specific services, 2 = on for all connections
-	if trimmedOutput == "0" {
+	lower := strings.ToLower(output)
+	if strings.Contains(lower, "disabled") || strings.Contains(lower, "state = 0") {
 		return &models.Finding{
 			ID:          "SYS-003",
 			Category:    "system",
 			Severity:    models.SeverityHigh,
 			Title:       "Firewall disabled",
 			Description: "macOS firewall is disabled, leaving the system exposed to network attacks",
-			Remediation: "Enable firewall: System Preferences → Security & Privacy → Firewall → Turn On Firewall",
-			Evidence:    []string{"Firewall state: disabled (globalstate: 0)"},
+			Remediation: fmt.Sprintf("Enable firewall: %s → Network → Firewall → Turn On Firewall", s.systemSettings()),
+			Evidence:    []string{"Firewall state: " + strings.TrimSpace(output)},
 			Timestamp:   time.Now(),
 		}, nil
 	}
 
-	// Report when firewall is enabled (positive finding)
 	fwStatus := "specific services"
-	if strings.Contains(trimmedOutput, "2") {
+	if strings.Contains(lower, "block all") || strings.Contains(lower, "state = 2") {
 		fwStatus = "all connections"
 	}
 	return &models.Finding{
@@ -245,7 +242,8 @@ func (s *Scanner) checkFirewall(ctx context.Context) (*models.Finding, error) {
 		Title:       "Firewall enabled ✓",
 		Description: fmt.Sprintf("macOS firewall is active, protecting against incoming connections on %s", fwStatus),
 		Remediation: "No action needed",
-		Evidence:    []string{fmt.Sprintf("Firewall state: enabled (%s)", fwStatus)},
+		Evidence:    []string{strings.TrimSpace(output)},
+		Passed:      true,
 		Timestamp:   time.Now(),
 	}, nil
 }
@@ -289,29 +287,32 @@ func (s *Scanner) checkOpenPorts(ctx context.Context) (*models.Finding, error) {
 
 // checkPasswordPolicy checks local password complexity requirements
 func (s *Scanner) checkPasswordPolicy(ctx context.Context) (*models.Finding, error) {
-	// macOS: check pwpolicy for complexity requirements
-	if s.platform == "darwin" {
-		output, err := s.platform_util.RunCommand(ctx, "pwpolicy", "getaccountpolicies")
-		if err != nil {
-			return nil, nil
-		}
-
-		// Check if password policy requires complexity
-		if !strings.Contains(output, "requiresAlpha") && !strings.Contains(output, "requiresNumeric") {
-			return &models.Finding{
-				ID:          "PWD-001",
-				Category:    "configs",
-				Severity:    models.SeverityMedium,
-				Title:       "Weak password policy configured",
-				Description: "System does not enforce password complexity requirements (uppercase, numbers, special chars)",
-				Remediation: "Enable password complexity via: System Preferences → Security & Privacy → Users & Groups → Edit password policy",
-				Evidence:    []string{"Password policy does not require alphanumeric characters"},
-				Timestamp:   time.Now(),
-			}, nil
+	// pwpolicy getaccountpolicies (without hyphen) was removed in macOS 14.
+	// Try configuration profiles (MDM), then pwpolicy -getaccountpolicies (hyphen variant).
+	profileOutput, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "profiles show -type configuration 2>/dev/null | grep -i 'minLength\\|minComplexChars\\|requireAlphanumeric'")
+	if strings.TrimSpace(profileOutput) != "" {
+		if strings.Contains(profileOutput, "requireAlphanumeric") || strings.Contains(profileOutput, "minComplexChars") {
+			return positiveAuditFinding("PWD-001-OK", "Password complexity policy enforced ✓", "MDM profile enforces password complexity", "Password policy meets requirements"), nil
 		}
 	}
 
-	return nil, nil
+	policyOutput, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "pwpolicy -getaccountpolicies 2>/dev/null")
+	if strings.TrimSpace(policyOutput) != "" {
+		if strings.Contains(policyOutput, "requiresAlpha") || strings.Contains(policyOutput, "requiresNumeric") {
+			return positiveAuditFinding("PWD-001-OK", "Password complexity policy enforced ✓", "pwpolicy reports complexity requirements active", "Password policy meets requirements"), nil
+		}
+	}
+
+	return &models.Finding{
+		ID:          "PWD-001",
+		Category:    "configs",
+		Severity:    models.SeverityMedium,
+		Title:       "Password complexity policy not enforced",
+		Description: "No password complexity policy detected. Without complexity requirements, users may set trivially weak passwords.",
+		Remediation: fmt.Sprintf("Enable via MDM profile or %s → Users & Groups → Password Options", s.systemSettings()),
+		Evidence:    []string{"No complexity policy found via profiles or pwpolicy"},
+		Timestamp:   time.Now(),
+	}, nil
 }
 
 // checkSSHConfig checks SSH configuration security
@@ -376,7 +377,7 @@ func (s *Scanner) checkSSHKeyPermissions(ctx context.Context) (*models.Finding, 
 		return nil, nil
 	}
 
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("ls -la %s/id_* 2>/dev/null", sshDir))
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("ls -la \"%s\"/id_* 2>/dev/null", strings.ReplaceAll(sshDir, `"`, `\"`)))
 	if err != nil || strings.TrimSpace(output) == "" {
 		return nil, nil
 	}
@@ -405,12 +406,12 @@ func (s *Scanner) checkSSHKeyPermissions(ctx context.Context) (*models.Finding, 
 
 	if len(evidence) > 0 {
 		return &models.Finding{
-			ID:          "SSH-003",
+			ID:          "SSH-005",
 			Category:    "permissions",
 			Severity:    models.SeverityCritical,
 			Title:       "SSH private keys readable by others",
 			Description: "SSH private keys should only be readable by the owner (600). Readable keys allow attackers to impersonate you.",
-			Remediation: fmt.Sprintf("Fix permissions: chmod 600 %s/id_*", sshDir),
+			Remediation: fmt.Sprintf("Fix permissions: chmod 600 \"%s\"/id_*", sshDir),
 			Evidence:    evidence,
 			Timestamp:   time.Now(),
 		}, nil
@@ -564,7 +565,7 @@ func (s *Scanner) checkFileVaultStatus(ctx context.Context) (*models.Finding, er
 			Severity:    models.SeverityCritical,
 			Title:       "FileVault encryption disabled",
 			Description: "Disk encryption is not enabled. All data is accessible if device is lost or stolen.",
-			Remediation: "Enable FileVault: System Preferences → Security & Privacy → FileVault",
+			Remediation: fmt.Sprintf("Enable FileVault: %s → Privacy & Security → FileVault", s.systemSettings()),
 			Evidence:    []string{"FileVault: disabled"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -760,7 +761,7 @@ func (s *Scanner) checkGuestAccountEnabled(ctx context.Context) (*models.Finding
 		Severity:    models.SeverityHigh,
 		Title:       "Guest account enabled",
 		Description: "Guest account allows anyone with physical access to log in and access the system.",
-		Remediation: "System Preferences → Users & Groups → uncheck 'Allow guests to log in'",
+		Remediation: fmt.Sprintf("%s → Users & Groups → uncheck 'Allow guests to log in'", s.systemSettings()),
 		Evidence:    []string{"Guest account enabled"},
 		Timestamp:   time.Now(),
 	}, nil
@@ -776,7 +777,7 @@ func (s *Scanner) checkAutomaticLoginEnabled(ctx context.Context) (*models.Findi
 			Severity:    models.SeverityHigh,
 			Title:       "Automatic login enabled",
 			Description: "Automatic login bypasses the login screen. Anyone with physical access can use the computer.",
-			Remediation: "System Preferences → Security & Privacy → uncheck 'Automatic login'",
+			Remediation: fmt.Sprintf("%s → General → Login Options → disable Automatic login", s.systemSettings()),
 			Evidence:    []string{fmt.Sprintf("Automatic login: %s", strings.TrimSpace(output))},
 			Timestamp:   time.Now(),
 		}, nil
@@ -846,6 +847,21 @@ func positiveAuditFinding(id, title, description, evidence string) *models.Findi
 	}
 }
 
+// Helper function to return a skipped finding (check not applicable on this OS/hardware)
+func skippedFinding(id, title, reason string) *models.Finding {
+	return &models.Finding{
+		ID:          id + "-SKIP",
+		Category:    "audit",
+		Severity:    models.SeverityInfo,
+		Title:       title,
+		Description: reason,
+		Remediation: "Verify manually or run on a supported configuration.",
+		Evidence:    []string{reason},
+		Skipped:     true,
+		Timestamp:   time.Now(),
+	}
+}
+
 // checkSystemUpdates checks if macOS is up to date
 func (s *Scanner) checkSystemUpdates(ctx context.Context) (*models.Finding, error) {
 	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "softwareupdate -l 2>/dev/null | grep -i 'security\\|critical'")
@@ -856,7 +872,7 @@ func (s *Scanner) checkSystemUpdates(ctx context.Context) (*models.Finding, erro
 			Severity:    models.SeverityCritical,
 			Title:       "Security updates available",
 			Description: "macOS has pending security updates. Not applying security patches leaves system vulnerable to known exploits.",
-			Remediation: "Run: softwareupdate -i -a or System Preferences → Software Update",
+			Remediation: fmt.Sprintf("Run: softwareupdate -i -a or %s → General → Software Update", s.systemSettings()),
 			Evidence:    []string{fmt.Sprintf("Available updates: %s", strings.TrimSpace(output))},
 			Timestamp:   time.Now(),
 		}, nil
@@ -880,7 +896,7 @@ func (s *Scanner) checkBluetoothDiscoverability(ctx context.Context) (*models.Fi
 			Severity:    models.SeverityMedium,
 			Title:       "Bluetooth is enabled",
 			Description: "Bluetooth is enabled and could be discoverable. Attackers can use Bluetooth to pair devices or perform BlueTooth exploits.",
-			Remediation: "Disable Bluetooth when not needed: System Preferences → Bluetooth → Turn Off",
+			Remediation: fmt.Sprintf("Disable Bluetooth when not needed: %s → Bluetooth → Turn Off", s.systemSettings()),
 			Evidence:    []string{"Bluetooth is powered on"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -900,7 +916,7 @@ func (s *Scanner) checkMicrophoneCamera(ctx context.Context) (*models.Finding, e
 			Severity:    models.SeverityInfo,
 			Title:       "Camera/Microphone recent activity detected",
 			Description: "Camera or microphone activity detected in logs. This is normal if you've used video/audio apps recently.",
-			Remediation: "Review app permissions: System Preferences → Security & Privacy → Camera/Microphone",
+			Remediation: fmt.Sprintf("Review app permissions: %s → Privacy & Security → Camera/Microphone", s.systemSettings()),
 			Evidence:    []string{"Recent camera/microphone access detected"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -934,16 +950,23 @@ func (s *Scanner) checkTouchIDForSudo(ctx context.Context) (*models.Finding, err
 
 // checkSSHServiceStatus checks if SSH service is actually disabled
 func (s *Scanner) checkSSHServiceStatus(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "launchctl list | grep -i ssh")
-	if err == nil && strings.TrimSpace(output) != "" {
+	// Query the specific service label rather than piped grep to avoid false matches
+	// (e.g. com.apple.sshd-keygen-runner which is not the SSH server)
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "launchctl list com.openssh.sshd 2>/dev/null")
+	// launchctl list <label> returns "Could not find service" if not loaded
+	sshRunning := err == nil &&
+		strings.TrimSpace(output) != "" &&
+		!strings.Contains(output, "Could not find")
+
+	if sshRunning {
 		return &models.Finding{
 			ID:          "SSH-003",
 			Category:    "network",
 			Severity:    models.SeverityHigh,
 			Title:       "SSH service is running",
 			Description: "SSH daemon is running and accepting connections. If not needed, disable it to reduce attack surface.",
-			Remediation: "Disable SSH: sudo systemsetup -setremotelogin off",
-			Evidence:    []string{"SSH service is loaded and running"},
+			Remediation: fmt.Sprintf("Disable SSH: %s → General → Sharing → Remote Login → disable", s.systemSettings()),
+			Evidence:    []string{"com.openssh.sshd is loaded and running"},
 			Timestamp:   time.Now(),
 		}, nil
 	}
@@ -964,7 +987,7 @@ func (s *Scanner) checkVPNStatus(ctx context.Context) (*models.Finding, error) {
 				Severity:    models.SeverityMedium,
 				Title:       "VPN configured but not connected",
 				Description: "VPN is configured but currently not active. Enable it for privacy on untrusted networks.",
-				Remediation: "Connect to VPN in System Preferences → Network → VPN",
+				Remediation: fmt.Sprintf("Connect to VPN in %s → VPN", s.systemSettings()),
 				Evidence:    []string{"VPN service available but not active"},
 				Timestamp:   time.Now(),
 			}, nil
@@ -992,7 +1015,7 @@ func (s *Scanner) checkDNSOverHTTPS(ctx context.Context) (*models.Finding, error
 		Severity:    models.SeverityLow,
 		Title:       "Standard DNS in use (not DoH/DoT)",
 		Description: "Using standard unencrypted DNS. ISP/network can see all domain lookups. Consider DoH/DoT.",
-		Remediation: "Configure DNS over HTTPS: System Preferences → Network → Wi-Fi → Advanced → DNS → Use Cloudflare (1.1.1.1)",
+		Remediation: fmt.Sprintf("Configure DNS over HTTPS: %s → Network → Wi-Fi → Details → DNS → set to 1.1.1.1 (Cloudflare)", s.systemSettings()),
 		Evidence:    []string{"DNS configuration uses standard DNS servers"},
 		Timestamp:   time.Now(),
 	}, nil
@@ -1006,10 +1029,16 @@ func (s *Scanner) checkBrowserSecurity(ctx context.Context) (*models.Finding, er
 	// Check if Chrome/Safari store passwords unencrypted
 	chromePrefs := homeDir + "/Library/Application Support/Google/Chrome/Default/Preferences"
 
-	// Check Chrome for password saving
+	// Check Chrome for password saving — check both known keys for this setting
 	if s.platform_util.FileExists(chromePrefs) {
 		content, _ := s.platform_util.ReadFile(chromePrefs)
-		if strings.Contains(content, "\"password_manager_enabled\":true") {
+		// credentials_enable_service is the current key; password_manager_enabled is legacy
+		managerEnabled := strings.Contains(content, `"credentials_enable_service":true`) ||
+			strings.Contains(content, `"password_manager_enabled":true`)
+		// Explicitly disabled overrides the above
+		managerDisabled := strings.Contains(content, `"credentials_enable_service":false`) ||
+			strings.Contains(content, `"password_manager_enabled":false`)
+		if managerEnabled && !managerDisabled {
 			return &models.Finding{
 				ID:          "BROWSER-001",
 				Category:    "browser",
@@ -1017,7 +1046,7 @@ func (s *Scanner) checkBrowserSecurity(ctx context.Context) (*models.Finding, er
 				Title:       "Browser password manager stores passwords",
 				Description: "Chrome/Edge is configured to save passwords. Passwords stored in plaintext can be accessed by malware.",
 				Remediation: "Disable password saving: Chrome → Settings → Passwords → Turn off 'Offer to save passwords'",
-				Evidence:    []string{"Chrome password manager is enabled"},
+				Evidence:    []string{"Chrome password manager is enabled (credentials_enable_service or password_manager_enabled)"},
 				Timestamp:   time.Now(),
 			}, nil
 		}
@@ -1036,7 +1065,7 @@ func (s *Scanner) checkiCloudKeychain(ctx context.Context) (*models.Finding, err
 			Severity:    models.SeverityLow,
 			Title:       "iCloud Keychain not configured",
 			Description: "iCloud Keychain is not enabled. This secures passwords across Apple devices if configured.",
-			Remediation: "Enable iCloud Keychain: System Preferences → [Apple ID] → iCloud → Keychain",
+			Remediation: fmt.Sprintf("Enable iCloud Keychain: %s → [Apple ID] → iCloud → Passwords & Keychain", s.systemSettings()),
 			Evidence:    []string{"iCloud Keychain not found in system keychains"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1058,7 +1087,7 @@ func (s *Scanner) checkAppleID2FA(ctx context.Context) (*models.Finding, error) 
 		Severity:    models.SeverityInfo,
 		Title:       "Apple ID 2FA status unknown",
 		Description: "Cannot programmatically verify Apple ID 2FA status. Manually confirm it is enabled.",
-		Remediation: "Verify 2FA: System Preferences → [Apple ID] → Password & Security → Two-Factor Authentication",
+		Remediation: fmt.Sprintf("Verify 2FA: %s → [Apple ID] → Password & Security → Two-Factor Authentication", s.systemSettings()),
 		Evidence:    []string{"2FA status cannot be determined programmatically"},
 		Timestamp:   time.Now(),
 	}, nil
@@ -1076,29 +1105,57 @@ func (s *Scanner) checkWiFiPasswordStorage(ctx context.Context) (*models.Finding
 	return positiveAuditFinding("NET-005-OK", "Network configuration checked ✓", "WiFi settings verified", "Network passwords secured"), nil
 }
 
-// checkSecureBootT2 checks T2 security chip and Secure Boot status
+// checkSecureBootT2 checks T2/Apple Silicon secure boot status
 func (s *Scanner) checkSecureBootT2(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "system_profiler SPiBridgeType 2>/dev/null | grep -i 'Apple T2'")
-	if err == nil && strings.TrimSpace(output) != "" {
-		// T2 present, check if SecureBoot is enabled
+	// Detect CPU architecture: sysctl returns "1" on Apple Silicon
+	armResult, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "sysctl -n hw.optional.arm64 2>/dev/null")
+	isAppleSilicon := strings.TrimSpace(armResult) == "1"
+
+	if isAppleSilicon {
+		// Apple Silicon: secure boot is handled by the SoC (not T2).
+		// bputil can report the security policy if run with sufficient privileges.
+		sbOutput, err := s.platform_util.RunCommand(ctx, "sh", "-c", "bputil -d 2>/dev/null | grep -i 'secure boot'")
+		if err != nil || strings.TrimSpace(sbOutput) == "" {
+			// bputil requires root or SIP; if unavailable emit a skipped finding
+			return skippedFinding("FW-001", "Secure Boot (Apple Silicon)", "bputil requires root to query secure boot policy on Apple Silicon — run vectorscan with sudo for this check"), nil
+		}
+		if strings.Contains(strings.ToLower(sbOutput), "full") || strings.Contains(strings.ToLower(sbOutput), "enabled") {
+			return positiveAuditFinding("FW-001-OK", "Secure Boot enabled ✓", "Apple Silicon full security mode active", "SoC secure boot protection active"), nil
+		}
+		return &models.Finding{
+			ID:          "FW-001",
+			Category:    "firmware",
+			Severity:    models.SeverityMedium,
+			Title:       "Apple Silicon Secure Boot not in full security mode",
+			Description: "Secure Boot is not in full security mode. Enable it for maximum firmware protection.",
+			Remediation: "Boot into Recovery Mode (hold Power button), then Utilities → Startup Security Utility → Full Security",
+			Evidence:    []string{strings.TrimSpace(sbOutput)},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+
+	// Intel: check for T2 chip
+	t2Output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "system_profiler SPiBridgeDataType 2>/dev/null | grep -i 'Apple T2'")
+	if err == nil && strings.TrimSpace(t2Output) != "" {
+		// T2 present, check secure boot mode via nvram
 		sbOutput, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "nvram -p 2>/dev/null | grep -i 'secure-boot-mode'")
 		if strings.Contains(sbOutput, "full") {
 			return positiveAuditFinding("FW-001-OK", "Secure Boot enabled ✓", "T2 chip with full secure boot", "Firmware protection active"), nil
 		}
-
 		return &models.Finding{
 			ID:          "FW-001",
 			Category:    "firmware",
 			Severity:    models.SeverityMedium,
 			Title:       "T2 Secure Boot not in full security mode",
 			Description: "T2 chip is present but Secure Boot is not in full security mode. Enable it for maximum firmware protection.",
-			Remediation: "Boot into Recovery Mode (Cmd+R), Utilities → Firmware Password Utility → Enable",
+			Remediation: "Boot into Recovery Mode (Cmd+R), Utilities → Startup Security Utility → Full Security",
 			Evidence:    []string{"T2 chip detected but Secure Boot mode is reduced"},
 			Timestamp:   time.Now(),
 		}, nil
 	}
 
-	return positiveAuditFinding("FW-001-OK", "Firmware security configured ✓", "Secure Boot status verified", "Firmware protection baseline met"), nil
+	// No T2 and not Apple Silicon — older Intel Mac without T2
+	return skippedFinding("FW-001", "Secure Boot (T2/Apple Silicon)", "No T2 chip or Apple Silicon detected — secure boot not available on this hardware"), nil
 }
 
 // System & Authentication Checks
@@ -1110,15 +1167,27 @@ func (s *Scanner) checkRootSSHLogin(ctx context.Context) (*models.Finding, error
 		return positiveAuditFinding("AUTH-001-OK", "SSH root login check passed ✓", "SSH daemon not accessible", "Cannot verify SSH config"), nil
 	}
 
-	if strings.Contains(content, "PermitRootLogin yes") && !strings.Contains(content, "#PermitRootLogin yes") {
+	rootLoginPermitted := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue // skip commented-out lines regardless of spacing
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) >= 2 && strings.EqualFold(fields[0], "PermitRootLogin") && strings.EqualFold(fields[1], "yes") {
+			rootLoginPermitted = true
+			break
+		}
+	}
+	if rootLoginPermitted {
 		return &models.Finding{
 			ID:          "AUTH-001",
 			Category:    "authentication",
 			Severity:    models.SeverityCritical,
 			Title:       "Root SSH login permitted",
-			Description: "PermitRootLogin is enabled in sshd_config, allowing direct root login via SSH",
-			Remediation: "Edit /etc/ssh/sshd_config: change 'PermitRootLogin yes' to 'PermitRootLogin no', then sudo systemctl restart ssh",
-			Evidence:    []string{"PermitRootLogin yes found in /etc/ssh/sshd_config"},
+			Description: "PermitRootLogin yes is set in sshd_config, allowing direct root login via SSH",
+			Remediation: "Edit /etc/ssh/sshd_config: set 'PermitRootLogin no', then: sudo launchctl kickstart -k system/com.openssh.sshd",
+			Evidence:    []string{"PermitRootLogin yes found (uncommented) in /etc/ssh/sshd_config"},
 			Timestamp:   time.Now(),
 		}, nil
 	}
@@ -1126,38 +1195,57 @@ func (s *Scanner) checkRootSSHLogin(ctx context.Context) (*models.Finding, error
 	return positiveAuditFinding("AUTH-001-OK", "Root SSH login disabled ✓", "SSH root access denied", "Direct root SSH login is disabled"), nil
 }
 
-// checkEmptyPasswordAccounts checks for accounts with empty passwords
+// checkEmptyPasswordAccounts checks for accounts with no password hash on macOS
 func (s *Scanner) checkEmptyPasswordAccounts(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "awk -F: '($2==\"\") {print $1}' /etc/shadow 2>/dev/null")
+	// /etc/shadow is Linux-only. On macOS, password hashes live in the local directory service.
+	// dscl ShadowHashData requires root; without root we flag the root account directly.
+	// With root: scan all non-system users (UID >= 500) for missing ShadowHashData.
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c",
+		`dscl . -list /Users UniqueID 2>/dev/null | awk '$2+0 >= 500 {print $1}' | while read u; do`+
+			` shadow=$(dscl . -read "/Users/$u" ShadowHashData 2>/dev/null | grep -v "^ShadowHashData:$" | tr -d ' \n');`+
+			` [ -z "$shadow" ] && echo "$u"; done 2>/dev/null`)
 	if err == nil && strings.TrimSpace(output) != "" {
 		users := strings.TrimSpace(output)
 		return &models.Finding{
 			ID:          "AUTH-002",
 			Category:    "authentication",
 			Severity:    models.SeverityCritical,
-			Title:       "Users with empty passwords detected",
-			Description: fmt.Sprintf("Following accounts have no password set and can login without authentication: %s", users),
-			Remediation: "Set passwords for all accounts: sudo passwd <username>",
-			Evidence:    []string{fmt.Sprintf("Empty password accounts: %s", users)},
+			Title:       "Users with no password hash detected",
+			Description: fmt.Sprintf("The following accounts have no password hash and may allow password-less login: %s", users),
+			Remediation: "Set a password for each account: sudo dscl . -passwd /Users/<username> <newpassword>",
+			Evidence:    []string{fmt.Sprintf("Accounts without password hash: %s", users)},
 			Timestamp:   time.Now(),
 		}, nil
 	}
 
-	return positiveAuditFinding("AUTH-002-OK", "No empty password accounts ✓", "All accounts require passwords", "Strong password enforcement in place"), nil
+	return positiveAuditFinding("AUTH-002-OK", "No empty password accounts ✓", "All user accounts have password hashes set", "Password enforcement in place"), nil
 }
 
 // checkPasswordExpiration checks if password expiration policy is set
 func (s *Scanner) checkPasswordExpiration(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p /var/db/dslocal/nodes/Default/users/root.plist 2>/dev/null | grep -i maxPasswordAge")
+	// Check the current user's plist, not just root (which is usually locked anyway)
+	currentUser, err := s.platform_util.RunCommand(ctx, "sh", "-c", "id -un 2>/dev/null")
+	if err != nil || strings.TrimSpace(currentUser) == "" {
+		currentUser = "root"
+	}
+	currentUser = strings.TrimSpace(currentUser)
+
+	plistPath := fmt.Sprintf("/var/db/dslocal/nodes/Default/users/%s.plist", currentUser)
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("plutil -p %q 2>/dev/null | grep -i maxPasswordAge", plistPath))
 	if err != nil || strings.TrimSpace(output) == "" {
+		// Also check via configuration profiles (MDM)
+		profileOutput, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "profiles show -type configuration 2>/dev/null | grep -i 'maxPINAgeInDays\\|maxPasscodeAge\\|maxPasswordAge'")
+		if strings.TrimSpace(profileOutput) != "" {
+			return positiveAuditFinding("AUTH-003-OK", "Password expiration configured ✓", "MDM profile enforces password expiration", "Periodic password changes required"), nil
+		}
 		return &models.Finding{
 			ID:          "AUTH-003",
 			Category:    "authentication",
 			Severity:    models.SeverityMedium,
 			Title:       "Password expiration policy not configured",
 			Description: "Passwords do not expire. Require periodic password changes for security.",
-			Remediation: "Configure password policy: System Preferences → Users & Groups → Password Options → Require password change every X days",
-			Evidence:    []string{"No password expiration policy detected"},
+			Remediation: fmt.Sprintf("Configure password policy: %s → Users & Groups → Password Options → Require password change every X days", s.systemSettings()),
+			Evidence:    []string{fmt.Sprintf("No password expiration policy for user '%s'", currentUser)},
 			Timestamp:   time.Now(),
 		}, nil
 	}
@@ -1175,7 +1263,7 @@ func (s *Scanner) checkAccountLockout(ctx context.Context) (*models.Finding, err
 			Severity:    models.SeverityMedium,
 			Title:       "Account lockout policy not configured",
 			Description: "No account lockout after failed login attempts. Attackers can brute force passwords.",
-			Remediation: "Enable account lockout: System Preferences → Security & Privacy → General → Lock after X failed login attempts",
+			Remediation: fmt.Sprintf("Enable account lockout: %s → Privacy & Security → Advanced → Lock after X failed login attempts", s.systemSettings()),
 			Evidence:    []string{"No account lockout policy found"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1189,10 +1277,11 @@ func (s *Scanner) checkLoginWindowSecurity(ctx context.Context) (*models.Finding
 	config, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p /Library/Preferences/com.apple.loginwindow.plist 2>/dev/null")
 	issues := []string{}
 
-	// Check remote login via systemsetup (more reliable than plist)
-	remoteLogin, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "systemsetup -getremotelogin 2>/dev/null")
-	if strings.Contains(strings.ToLower(remoteLogin), "on") {
-		issues = append(issues, "Remote login enabled")
+	// systemsetup -getremotelogin was removed in macOS 14 Sonoma.
+	// Use launchctl to check if SSH daemon is loaded instead (works on all macOS versions).
+	sshStatus, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "launchctl list com.openssh.sshd 2>/dev/null")
+	if strings.TrimSpace(sshStatus) != "" && !strings.Contains(sshStatus, "Could not find") {
+		issues = append(issues, "Remote login (SSH) enabled")
 	}
 	if strings.Contains(config, "\"showPasswordHints\" => 1") || strings.Contains(config, "\"showPasswordHints\" => true") {
 		issues = append(issues, "Password hints displayed on login window")
@@ -1205,7 +1294,7 @@ func (s *Scanner) checkLoginWindowSecurity(ctx context.Context) (*models.Finding
 			Severity:    models.SeverityMedium,
 			Title:       "Login window security weakened",
 			Description: fmt.Sprintf("Insecure login window settings detected: %s", strings.Join(issues, ", ")),
-			Remediation: "Disable remote login and password hints in System Preferences → Security & Privacy",
+			Remediation: fmt.Sprintf("Disable remote login and password hints in %s → General → Sharing", s.systemSettings()),
 			Evidence:    issues,
 			Timestamp:   time.Now(),
 		}, nil
@@ -1216,8 +1305,44 @@ func (s *Scanner) checkLoginWindowSecurity(ctx context.Context) (*models.Finding
 
 // Kernel & Core Checks
 
-// checkKernelExtensions checks for unsigned/untrusted kernel extensions
+// checkKernelExtensions checks for unsigned/untrusted kernel extensions or system extensions
 func (s *Scanner) checkKernelExtensions(ctx context.Context) (*models.Finding, error) {
+	// kextstat was deprecated in macOS 12 and is non-functional on macOS 13+.
+	// macOS 13+ uses System Extensions (DriverKit) instead of kernel extensions.
+	if s.osMajorVersion >= 13 {
+		output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "systemextensionsctl list 2>/dev/null | grep -v 'com.apple'")
+		if err == nil && strings.TrimSpace(output) != "" {
+			// Filter out header lines that don't contain actual extension entries
+			lines := strings.Split(strings.TrimSpace(output), "\n")
+			var thirdParty []string
+			for _, line := range lines {
+				line = strings.TrimSpace(line)
+				// Skip empty lines, section headers (---), and column headers
+				if line == "" || strings.HasPrefix(line, "--") || strings.HasPrefix(line, "System Extensions:") {
+					continue
+				}
+				// Real extension lines contain a bundle ID (contain at least one dot and a status keyword)
+				if strings.Contains(line, ".") && (strings.Contains(line, "activated") || strings.Contains(line, "enabled") || strings.Contains(line, "terminated")) {
+					thirdParty = append(thirdParty, line)
+				}
+			}
+			if len(thirdParty) > 0 {
+				return &models.Finding{
+					ID:          "KERNEL-001",
+					Category:    "kernel",
+					Severity:    models.SeverityHigh,
+					Title:       "Third-party system extensions loaded",
+					Description: "Third-party system extensions are active. Review them to ensure they are trusted.",
+					Remediation: "Review system extensions: systemextensionsctl list. Remove untrusted ones via their parent app or System Settings → Privacy & Security → Security",
+					Evidence:    thirdParty,
+					Timestamp:   time.Now(),
+				}, nil
+			}
+		}
+		return positiveAuditFinding("KERNEL-001-OK", "System extensions secure ✓", "No unexpected third-party system extensions", "Only Apple system extensions active"), nil
+	}
+
+	// macOS 12 and below: use kextstat
 	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "kextstat 2>/dev/null | grep -v 'com.apple' | tail -n +2")
 	if err == nil && strings.TrimSpace(output) != "" {
 		return &models.Finding{
@@ -1238,7 +1363,7 @@ func (s *Scanner) checkKernelExtensions(ctx context.Context) (*models.Finding, e
 // checkKernelPanicAutoReboot checks if auto-reboot on kernel panic is enabled
 func (s *Scanner) checkKernelPanicAutoReboot(ctx context.Context) (*models.Finding, error) {
 	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "nvram -p 2>/dev/null | grep 'auto-boot' || defaults read /Library/Preferences/SystemConfiguration/com.apple.PowerManagement 2>/dev/null | grep -i 'AutoReboot'")
-	if err != nil || !strings.Contains(output, "true") && !strings.Contains(output, "1") {
+	if err != nil || (!strings.Contains(output, "true") && !strings.Contains(output, "1")) {
 		return &models.Finding{
 			ID:          "KERNEL-002",
 			Category:    "kernel",
@@ -1275,23 +1400,50 @@ func (s *Scanner) checkCoreDumps(ctx context.Context) (*models.Finding, error) {
 
 // Privacy & Access Control Checks
 
-// checkAccessibilityPermissions checks what apps have accessibility access
+// checkAccessibilityPermissions checks what apps have accessibility access via TCC
 func (s *Scanner) checkAccessibilityPermissions(ctx context.Context) (*models.Finding, error) {
-	dbPath := "/Library/Application Support/com.apple.sharedfilelist/com.apple.LSSharedFileList.ApplicationRecentDocuments/com.apple.accessibility.mru.sfl2"
-	if !s.platform_util.FileExists(dbPath) {
-		return positiveAuditFinding("PRIVACY-001-OK", "Accessibility access audit complete ✓", "No unauthorized accessibility access", "Accessibility database not populated"), nil
+	// TCC.db is the definitive source for accessibility permissions on macOS.
+	// System TCC DB requires root; user TCC DB is readable without root.
+	tccDB := "/Library/Application Support/com.apple.TCC/TCC.db"
+	userTccDB := fmt.Sprintf("%s/Library/Application Support/com.apple.TCC/TCC.db", func() string {
+		h, _ := s.platform_util.RunCommand(context.Background(), "sh", "-c", "echo ~")
+		return strings.TrimSpace(h)
+	}())
+
+	queryTCC := func(db string) string {
+		out, _ := s.platform_util.RunCommand(ctx, "sh", "-c",
+			fmt.Sprintf(`sqlite3 %q "SELECT client FROM access WHERE service='kTCCServiceAccessibility' AND auth_value=2" 2>/dev/null`, db))
+		return strings.TrimSpace(out)
 	}
 
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "sqlite3 \""+dbPath+"\" 'SELECT * FROM item_records' 2>/dev/null | head -20")
-	if err == nil && strings.TrimSpace(output) != "" {
+	var apps []string
+	if result := queryTCC(tccDB); result != "" {
+		apps = append(apps, strings.Split(result, "\n")...)
+	}
+	if result := queryTCC(userTccDB); result != "" {
+		apps = append(apps, strings.Split(result, "\n")...)
+	}
+
+	// Deduplicate
+	seen := map[string]bool{}
+	var unique []string
+	for _, a := range apps {
+		a = strings.TrimSpace(a)
+		if a != "" && !seen[a] {
+			seen[a] = true
+			unique = append(unique, a)
+		}
+	}
+
+	if len(unique) > 0 {
 		return &models.Finding{
 			ID:          "PRIVACY-001",
 			Category:    "privacy",
 			Severity:    models.SeverityMedium,
-			Title:       "Applications with accessibility permissions",
-			Description: "Multiple applications have been granted accessibility permissions. Review to remove unnecessary access.",
-			Remediation: "System Preferences → Security & Privacy → Accessibility → Review and remove apps",
-			Evidence:    []string{"Accessibility permissions granted to applications"},
+			Title:       fmt.Sprintf("Applications with accessibility permissions (%d)", len(unique)),
+			Description: "Applications have been granted accessibility permissions. Review to remove unnecessary access.",
+			Remediation: fmt.Sprintf("%s → Privacy & Security → Accessibility → Review and remove apps", s.systemSettings()),
+			Evidence:    unique,
 			Timestamp:   time.Now(),
 		}, nil
 	}
@@ -1310,7 +1462,7 @@ func (s *Scanner) checkLocationServices(ctx context.Context) (*models.Finding, e
 			Severity:    models.SeverityMedium,
 			Title:       fmt.Sprintf("Location services enabled for %s apps", count),
 			Description: "Multiple applications have location access. Review to minimize location data exposure.",
-			Remediation: "System Preferences → Security & Privacy → Location Services → Disable for unnecessary apps",
+			Remediation: fmt.Sprintf("%s → Privacy & Security → Location Services → Disable for unnecessary apps", s.systemSettings()),
 			Evidence:    []string{fmt.Sprintf("%s apps have location permissions", count)},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1348,7 +1500,7 @@ func (s *Scanner) checkAppStoreUnknownSources(ctx context.Context) (*models.Find
 			Severity:    models.SeverityCritical,
 			Title:       "App protection disabled - unknown sources allowed",
 			Description: "Gatekeeper/Spctl is disabled. Applications from any source can be installed and run.",
-			Remediation: "Enable Gatekeeper: sudo spctl --master-enable (or System Preferences → Security & Privacy → Allow apps)",
+			Remediation: fmt.Sprintf("Enable Gatekeeper: sudo spctl --master-enable (or %s → Privacy & Security → Allow apps)", s.systemSettings()),
 			Evidence:    []string{"Gatekeeper is disabled"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1359,7 +1511,7 @@ func (s *Scanner) checkAppStoreUnknownSources(ctx context.Context) (*models.Find
 
 // checkNotarization checks if app notarization is enforced
 func (s *Scanner) checkNotarization(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "sudo codesign -v /Applications/Safari.app 2>&1 | grep -i 'notarized\\|notary'")
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "codesign -dv /Applications/Safari.app 2>&1 | grep -i 'notarized\\|notary\\|TeamIdentifier'")
 	if err != nil || strings.TrimSpace(output) == "" {
 		return &models.Finding{
 			ID:          "PRIVACY-005",
@@ -1367,7 +1519,7 @@ func (s *Scanner) checkNotarization(ctx context.Context) (*models.Finding, error
 			Severity:    models.SeverityMedium,
 			Title:       "App notarization not verified",
 			Description: "Cannot verify notarization status of installed applications.",
-			Remediation: "System Preferences → Security & Privacy → Verify app signatures: codesign -v /path/to/app",
+			Remediation: fmt.Sprintf("%s → Privacy & Security → Verify app signatures: codesign -v /path/to/app", s.systemSettings()),
 			Evidence:    []string{"App notarization status unknown"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1380,12 +1532,18 @@ func (s *Scanner) checkNotarization(ctx context.Context) (*models.Finding, error
 
 // checkSSHKeyAlgorithms checks for weak SSH key algorithms
 func (s *Scanner) checkSSHKeyAlgorithms(ctx context.Context) (*models.Finding, error) {
-	rsaKeyPath := os.ExpandEnv("$HOME/.ssh/id_rsa")
+	// Use RunCommand to resolve home dir rather than trusting $HOME env var
+	homeDir, err := s.platform_util.RunCommand(ctx, "sh", "-c", "echo ~")
+	if err != nil {
+		return positiveAuditFinding("SSH-004-OK", "SSH key algorithms checked ✓", "SSH keys properly configured", "Standard key algorithms in use"), nil
+	}
+	homeDir = strings.TrimSpace(homeDir)
+	rsaKeyPath := homeDir + "/.ssh/id_rsa"
 	if !s.platform_util.FileExists(rsaKeyPath) {
 		return positiveAuditFinding("SSH-004-OK", "SSH key algorithms checked ✓", "SSH keys properly configured", "Standard key algorithms in use"), nil
 	}
 
-	output, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "ssh-keygen -l -f ~/.ssh/id_rsa 2>/dev/null | grep -i '1024\\|512'")
+	output, _ := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("ssh-keygen -l -f \"%s/.ssh/id_rsa\" 2>/dev/null | grep -i '1024\\|512'", strings.ReplaceAll(homeDir, `"`, `\"`)))
 	if strings.TrimSpace(output) != "" {
 		return &models.Finding{
 			ID:          "SSH-004",
@@ -1402,23 +1560,50 @@ func (s *Scanner) checkSSHKeyAlgorithms(ctx context.Context) (*models.Finding, e
 	return positiveAuditFinding("SSH-004-OK", "SSH key algorithms strong ✓", "RSA 2048+ or ED25519 in use", "Secure key exchange active"), nil
 }
 
-// checkWeakCiphers checks for deprecated SSL/TLS ciphers
+// checkWeakCiphers checks SSH server config for explicitly configured weak ciphers
 func (s *Scanner) checkWeakCiphers(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "openssl ciphers -v 2>/dev/null | grep -E 'DES|RC4|MD5|NULL'")
-	if err == nil && strings.TrimSpace(output) != "" {
+	// openssl ciphers -v lists what the library supports, not what's configured.
+	// Check sshd_config for explicitly weak ciphers instead — that's what matters.
+	sshdCiphers, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "grep -i '^Ciphers' /etc/ssh/sshd_config 2>/dev/null")
+	weakSSH := []string{"3des-cbc", "arcfour", "arcfour128", "arcfour256", "blowfish-cbc", "cast128-cbc", "aes128-cbc", "aes192-cbc", "aes256-cbc"}
+	if strings.TrimSpace(sshdCiphers) != "" {
+		lower := strings.ToLower(sshdCiphers)
+		var found []string
+		for _, weak := range weakSSH {
+			if strings.Contains(lower, weak) {
+				found = append(found, weak)
+			}
+		}
+		if len(found) > 0 {
+			return &models.Finding{
+				ID:          "CRYPTO-001",
+				Category:    "network",
+				Severity:    models.SeverityHigh,
+				Title:       "Weak SSH ciphers explicitly configured",
+				Description: "sshd_config enables deprecated cipher suites. These are vulnerable to known attacks.",
+				Remediation: "Edit /etc/ssh/sshd_config: remove weak ciphers and restart sshd. Prefer: chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com",
+				Evidence:    found,
+				Timestamp:   time.Now(),
+			}, nil
+		}
+	}
+
+	// Also check SSH client config for weak host key algorithms
+	clientKex, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "grep -i '^KexAlgorithms\\|^HostKeyAlgorithms' /etc/ssh/ssh_config ~/.ssh/config 2>/dev/null | grep -i 'diffie-hellman-group1\\|diffie-hellman-group14'")
+	if strings.TrimSpace(clientKex) != "" {
 		return &models.Finding{
 			ID:          "CRYPTO-001",
 			Category:    "network",
-			Severity:    models.SeverityHigh,
-			Title:       "Weak SSL/TLS ciphers available",
-			Description: "Deprecated cipher suites (DES, RC4, MD5, NULL) are still available. Disable them.",
-			Remediation: "Update OpenSSL configuration: edit /etc/ssl/openssl.cnf to disable weak ciphers",
-			Evidence:    []string{"Weak ciphers detected in OpenSSL"},
+			Severity:    models.SeverityMedium,
+			Title:       "Weak SSH key exchange algorithms configured",
+			Description: "SSH client config enables weak key exchange algorithms susceptible to downgrade attacks.",
+			Remediation: "Edit ~/.ssh/config: remove diffie-hellman-group1-sha1 and diffie-hellman-group14-sha1 from KexAlgorithms",
+			Evidence:    []string{strings.TrimSpace(clientKex)},
 			Timestamp:   time.Now(),
 		}, nil
 	}
 
-	return positiveAuditFinding("CRYPTO-001-OK", "Strong ciphers only ✓", "Modern TLS encryption", "Weak algorithms disabled"), nil
+	return positiveAuditFinding("CRYPTO-001-OK", "SSH cipher configuration secure ✓", "No weak ciphers explicitly configured in sshd_config", "Secure key exchange active"), nil
 }
 
 // checkDNSSECValidation checks if DNSSEC validation is enabled
@@ -1431,7 +1616,7 @@ func (s *Scanner) checkDNSSECValidation(ctx context.Context) (*models.Finding, e
 			Severity:    models.SeverityLow,
 			Title:       "DNSSEC validation not enabled",
 			Description: "DNSSEC validation is not configured. DNS responses are not validated for authenticity.",
-			Remediation: "Configure DNSSEC: edit /etc/resolv.conf or use System Preferences → Network → DNS",
+			Remediation: fmt.Sprintf("Configure DNSSEC: edit /etc/resolv.conf or use %s → Network → DNS", s.systemSettings()),
 			Evidence:    []string{"DNSSEC not found in DNS configuration"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1450,7 +1635,7 @@ func (s *Scanner) checkBonjourMDNS(ctx context.Context) (*models.Finding, error)
 			Severity:    models.SeverityLow,
 			Title:       "Bonjour/mDNS enabled",
 			Description: "Bonjour/mDNS service is active. On enterprise networks, disable for privacy.",
-			Remediation: "Disable Bonjour: System Preferences → Network → Advanced → DNS (uncheck mDNS)",
+			Remediation: fmt.Sprintf("Disable Bonjour: %s → Network → Wi-Fi → Details → DNS (uncheck mDNS)", s.systemSettings()),
 			Evidence:    []string{"mDNS responder is running"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1461,23 +1646,48 @@ func (s *Scanner) checkBonjourMDNS(ctx context.Context) (*models.Finding, error)
 
 // Logging & Monitoring Checks
 
-// checkAuditLogging checks if system audit logging is enabled
+// checkAuditLogging checks if system audit logging is enabled (macOS BSD audit)
 func (s *Scanner) checkAuditLogging(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "auditctl -l 2>/dev/null | head -1")
-	if err != nil || strings.Contains(output, "No rules") || strings.TrimSpace(output) == "" {
+	// Check if auditd is running via launchctl (service-specific query is more reliable than piped grep)
+	auditdRunning, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "launchctl list com.apple.auditd 2>/dev/null")
+	// Check audit_control for active flags
+	auditControl, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "cat /etc/security/audit_control 2>/dev/null | grep -v '^#' | grep -v '^$'")
+
+	// launchctl list <label> returns error text on macOS if service not found
+	trimmedRunning := strings.TrimSpace(auditdRunning)
+	auditdActive := trimmedRunning != "" &&
+		!strings.Contains(trimmedRunning, "Could not find") &&
+		!strings.Contains(strings.ToLower(trimmedRunning), "not found") &&
+		!strings.Contains(strings.ToLower(trimmedRunning), "error")
+	auditConfigured := strings.TrimSpace(auditControl) != ""
+
+	if !auditdActive {
 		return &models.Finding{
 			ID:          "AUDIT-001",
 			Category:    "audit",
 			Severity:    models.SeverityMedium,
-			Title:       "System audit logging not configured",
-			Description: "Audit daemon (auditd) is not configured or no rules are set. Cannot track security events.",
-			Remediation: "Configure auditd: sudo auditctl -w /etc/shadow -p wa -k passwd_changes (create audit rules)",
-			Evidence:    []string{"Audit daemon not configured or no audit rules"},
+			Title:       "BSD audit daemon not running",
+			Description: "macOS BSD audit daemon (auditd) is not active. Security events are not being logged.",
+			Remediation: "Enable audit daemon: sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.auditd.plist",
+			Evidence:    []string{"com.apple.auditd not found in launchctl"},
 			Timestamp:   time.Now(),
 		}, nil
 	}
 
-	return positiveAuditFinding("AUDIT-001-OK", "Audit logging enabled ✓", "Security events tracked", "Forensic capability active"), nil
+	if !auditConfigured {
+		return &models.Finding{
+			ID:          "AUDIT-001B",
+			Category:    "audit",
+			Severity:    models.SeverityLow,
+			Title:       "BSD audit control not configured",
+			Description: "Audit daemon is running but /etc/security/audit_control has no active configuration.",
+			Remediation: "Configure audit rules in /etc/security/audit_control and restart auditd",
+			Evidence:    []string{"auditd running but audit_control is empty or missing"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+
+	return positiveAuditFinding("AUDIT-001-OK", "Audit logging enabled ✓", "BSD auditd active and configured", "Security events tracked via macOS audit framework"), nil
 }
 
 // checkSystemLogRetention checks if logs are retained appropriately
@@ -1559,7 +1769,7 @@ func (s *Scanner) checkSleepIdleTimeout(ctx context.Context) (*models.Finding, e
 			Severity:    models.SeverityMedium,
 			Title:       "Sleep timeout disabled",
 			Description: "Computer never sleeps. Unattended systems are vulnerable to physical access.",
-			Remediation: "Enable sleep timeout: System Preferences → Energy Saver → Sleep after X minutes",
+			Remediation: fmt.Sprintf("Enable sleep timeout: %s → Lock Screen → Start screen saver / Turn display off", s.systemSettings()),
 			Evidence:    []string{"Sleep timeout is disabled (0 minutes)"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1578,7 +1788,7 @@ func (s *Scanner) checkTimeSync(ctx context.Context) (*models.Finding, error) {
 			Severity:    models.SeverityMedium,
 			Title:       "Time synchronization may be disabled",
 			Description: "NTP (Network Time Protocol) may not be properly configured. Incorrect time breaks security mechanisms.",
-			Remediation: "Enable NTP: System Preferences → Date & Time → Set date and time automatically",
+			Remediation: fmt.Sprintf("Enable NTP: %s → General → Date & Time → Set time and date automatically", s.systemSettings()),
 			Evidence:    []string{"NTP synchronization not detected"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1589,6 +1799,29 @@ func (s *Scanner) checkTimeSync(ctx context.Context) (*models.Finding, error) {
 
 // checkFirmwareUpdates checks for pending firmware updates
 func (s *Scanner) checkFirmwareUpdates(ctx context.Context) (*models.Finding, error) {
+	// Detect Apple Silicon
+	armResult, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "sysctl -n hw.optional.arm64 2>/dev/null")
+	isAppleSilicon := strings.TrimSpace(armResult) == "1"
+
+	if isAppleSilicon {
+		// On Apple Silicon, firmware is bundled with macOS updates — check softwareupdate
+		fwUpdates, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "softwareupdate --list 2>/dev/null | grep -i 'firmware'")
+		if strings.TrimSpace(fwUpdates) != "" {
+			return &models.Finding{
+				ID:          "CONFIG-003",
+				Category:    "configuration",
+				Severity:    models.SeverityMedium,
+				Title:       "Firmware update available",
+				Description: "A firmware update is available via softwareupdate. Apply it to stay protected.",
+				Remediation: fmt.Sprintf("Install firmware update: %s → General → Software Update", s.systemSettings()),
+				Evidence:    []string{strings.TrimSpace(fwUpdates)},
+				Timestamp:   time.Now(),
+			}, nil
+		}
+		return positiveAuditFinding("CONFIG-003-OK", "Firmware current ✓", "No pending Apple Silicon firmware updates", "Boot security patched"), nil
+	}
+
+	// Intel: check T2 bridge firmware version
 	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "system_profiler SPiBridgeDataType 2>/dev/null | grep -i 'Version'")
 	if err != nil || strings.TrimSpace(output) == "" {
 		return &models.Finding{
@@ -1597,7 +1830,7 @@ func (s *Scanner) checkFirmwareUpdates(ctx context.Context) (*models.Finding, er
 			Severity:    models.SeverityMedium,
 			Title:       "Firmware update status unknown",
 			Description: "Unable to verify firmware is up to date. Check for pending firmware security updates.",
-			Remediation: "Check firmware: System Preferences → System Update or use: softwareupdate -l",
+			Remediation: fmt.Sprintf("Check firmware: %s → General → Software Update, or run: softwareupdate -l", s.systemSettings()),
 			Evidence:    []string{"Firmware version could not be determined"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1639,7 +1872,7 @@ func (s *Scanner) checkRemoteManagement(ctx context.Context) (*models.Finding, e
 			Severity:    models.SeverityHigh,
 			Title:       "Remote management/screen sharing enabled",
 			Description: "Remote management or screen sharing is enabled. Disable if not needed.",
-			Remediation: "Disable Remote Management: System Preferences → Sharing → Uncheck Remote Management/Screen Sharing",
+			Remediation: fmt.Sprintf("Disable Remote Management: %s → General → Sharing → uncheck Remote Management/Screen Sharing", s.systemSettings()),
 			Evidence:    []string{"Remote management or VNC is active"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1660,7 +1893,7 @@ func (s *Scanner) checkSpotlightTelemetry(ctx context.Context) (*models.Finding,
 			Severity:    models.SeverityLow,
 			Title:       "Spotlight sends search queries to Apple",
 			Description: "Spotlight suggestions send search queries to Apple servers for processing.",
-			Remediation: "Disable Spotlight suggestions: System Preferences → Siri & Spotlight → Uncheck 'Suggestions'",
+			Remediation: fmt.Sprintf("Disable Spotlight suggestions: %s → Siri & Spotlight → uncheck 'Suggestions'", s.systemSettings()),
 			Evidence:    []string{"Spotlight internet results enabled"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1679,7 +1912,7 @@ func (s *Scanner) checkSiriAnalytics(ctx context.Context) (*models.Finding, erro
 			Severity:    models.SeverityLow,
 			Title:       "Siri usage analytics enabled",
 			Description: "Siri usage data is being sent to Apple for analytics and improvement purposes.",
-			Remediation: "Disable Siri analytics: System Preferences → Siri → Uncheck 'Improve Siri & Dictation'",
+			Remediation: fmt.Sprintf("Disable Siri analytics: %s → Siri → uncheck 'Improve Siri & Dictation'", s.systemSettings()),
 			Evidence:    []string{"Siri data sharing enabled"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1698,7 +1931,7 @@ func (s *Scanner) checkAppleAnalytics(ctx context.Context) (*models.Finding, err
 			Severity:    models.SeverityLow,
 			Title:       "Apple crash report analytics enabled",
 			Description: "Automatic crash report sharing with Apple is enabled.",
-			Remediation: "Disable: System Preferences → Security & Privacy → Analytics → Uncheck 'Share crash data'",
+			Remediation: fmt.Sprintf("Disable: %s → Privacy & Security → Analytics & Improvements → uncheck 'Share Mac Analytics'", s.systemSettings()),
 			Evidence:    []string{"Apple analytics sharing enabled"},
 			Timestamp:   time.Now(),
 		}, nil
