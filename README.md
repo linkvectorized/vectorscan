@@ -77,8 +77,8 @@ Findings Summary:
 # Install pre-built binary (macOS, no Go required)
 curl -fsSL https://raw.githubusercontent.com/linkvectorized/vectorscan/master/install.sh | bash
 
-# Run (sudo strips PATH, so use the full path)
-sudo /usr/local/bin/vectorscan
+# Run
+sudo vectorscan
 
 # Without root (partial results, warns you)
 vectorscan
@@ -160,8 +160,7 @@ Earned:              180 pts → 81%
 ## What you need
 
 - macOS (darwin)
-- Go 1.21+
-- 7 seconds
+- 10 seconds
 
 ---
 
