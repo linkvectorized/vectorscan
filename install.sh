@@ -25,8 +25,7 @@ ASSET="${BIN_NAME}-${OS}-${ARCH}"
 # Fetch latest release tag
 echo "Fetching latest release..."
 TAG=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-  | grep '"tag_name"' \
-  | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null)
 
 if [[ -z "$TAG" ]]; then
   echo "Could not determine latest release tag." >&2
