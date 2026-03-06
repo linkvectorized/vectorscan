@@ -36,14 +36,23 @@ $ sudo ./vectorscan
 ## Quick start
 
 ```bash
-# Build
-go build -o vectorscan ./cmd/vectorscan/
+# Install directly from GitHub (requires Go 1.21+)
+go install github.com/linkvectorized/vectorscan/cmd/vectorscan@latest
 
 # Run (some checks need root for full accuracy)
-sudo ./vectorscan
+sudo vectorscan
 
 # Without root (partial results, warns you)
-./vectorscan
+vectorscan
+```
+
+Or clone and build manually:
+
+```bash
+git clone https://github.com/linkvectorized/vectorscan
+cd vectorscan
+go build -o vectorscan ./cmd/vectorscan/
+sudo ./vectorscan
 ```
 
 ---
