@@ -77,8 +77,8 @@ Findings Summary:
 # Install directly from GitHub (requires Go 1.21+)
 go install github.com/linkvectorized/vectorscan/cmd/vectorscan@latest
 
-# Run (some checks need root for full accuracy)
-sudo vectorscan
+# Run (sudo strips PATH, so use $(which ...) or the full path)
+sudo $(which vectorscan)
 
 # Without root (partial results, warns you)
 vectorscan
