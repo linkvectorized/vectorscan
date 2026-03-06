@@ -19,7 +19,7 @@ func PrintTable(report *models.Report) {
 	fmt.Println("  ║            VECTORSCAN — System Security Audit            ║")
 	fmt.Println("  ╚══════════════════════════════════════════════════════════╝")
 	fmt.Printf("%s", nc)
-	fmt.Printf("  %sDon't trust the government. Big brother is always watching. Question everything.%s\n\n", yellow, nc)
+	fmt.Printf("  %sBig brother is always watching. Question everything. Especially the government.%s\n\n", yellow, nc)
 
 	// Summary section
 	fmt.Printf("Host:            %s\n", report.Hostname)

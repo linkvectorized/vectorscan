@@ -9,7 +9,7 @@
     ╚═══╝  ╚══════╝ ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚══════╝ ╚═════╝╚═╝  ╚═╝╚═╝  ╚═══╝
 ```
 
-> Don't trust the government. Big brother is always watching. Question everything.
+> Big brother is always watching. Question everything. Especially the government.
 
 Fast, opinionated system security audit tool. Scans your Mac for misconfigurations, weak defaults, and attack vectors — then tells you exactly what to fix. No agents, no cloud, no telemetry. Just a binary and the truth.
 
@@ -21,7 +21,7 @@ $ sudo ./vectorscan
   ╔══════════════════════════════════════════════════════════╗
   ║            VECTORSCAN — System Security Audit            ║
   ╚══════════════════════════════════════════════════════════╝
-  Don't trust the government. Big brother is always watching. Question everything.
+  Big brother is always watching. Question everything. Especially the government.
 
   [========================================] 100% (62/62) Firmware updates
 

@@ -9,7 +9,7 @@ import (
 // PrintMarkdown outputs the report in Markdown format
 func PrintMarkdown(report *models.Report) {
 	fmt.Println("# VECTORSCAN — System Security Audit Report")
-	fmt.Println("*Don't trust the government. Big brother is always watching. Question everything.*")
+	fmt.Println("*Big brother is always watching. Question everything. Especially the government.*")
 	fmt.Println()
 
 	// Summary section
