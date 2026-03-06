@@ -74,14 +74,21 @@ Findings Summary:
 ## Quick start
 
 ```bash
-# Install directly from GitHub (requires Go 1.21+)
-go install github.com/linkvectorized/vectorscan/cmd/vectorscan@latest
+# Install pre-built binary (macOS, no Go required)
+curl -fsSL https://raw.githubusercontent.com/linkvectorized/vectorscan/master/install.sh | bash
 
-# Run (sudo strips PATH, so use $(which ...) or the full path)
-sudo $(which vectorscan)
+# Run (sudo strips PATH, so use the full path)
+sudo /usr/local/bin/vectorscan
 
 # Without root (partial results, warns you)
 vectorscan
+```
+
+Or install from source (requires Go 1.21+):
+
+```bash
+go install github.com/linkvectorized/vectorscan/cmd/vectorscan@latest
+sudo $(which vectorscan)
 ```
 
 Or clone and build manually:
