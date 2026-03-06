@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,9 +18,12 @@ import (
 	// "github.com/linkvectorized/vectorscan/pkg/web" // TODO: uncomment when frontend ready
 )
 
-const (
-	version = "1.0.0"
-)
+var version = "dev"
+
+const repo = "linkvectorized/vectorscan"
+
+// goarch is baked in at compile time via runtime.GOARCH
+var goarch = runtime.GOARCH
 
 func main() {
 	// Define CLI flags
@@ -51,6 +58,12 @@ func main() {
 	if os.Geteuid() != 0 {
 		fmt.Fprintf(os.Stderr, "Warning: not running as root. Some checks may be incomplete or inaccurate.\n\n")
 	}
+
+	// Check for updates in background while scan runs
+	updateCh := make(chan string, 1)
+	go func() {
+		updateCh <- checkForUpdate()
+	}()
 
 	// Create scanner
 	s, err := scanner.New()
@@ -100,6 +113,11 @@ func main() {
 	// 	return
 	// }
 
+	// Apply update if one was found
+	if msg := <-updateCh; msg != "" {
+		fmt.Fprintln(os.Stderr, msg)
+	}
+
 	// Output results based on format
 	switch *outputFormat {
 	case "table":
@@ -111,6 +129,65 @@ func main() {
 	case "markdown":
 		output.PrintMarkdown(report)
 	}
+}
+
+// checkForUpdate fetches the latest release tag from GitHub and self-updates if behind.
+// Returns a status message or empty string if already current.
+func checkForUpdate() string {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("https://api.github.com/repos/" + repo + "/releases/latest")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var release struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		return ""
+	}
+
+	latest := strings.TrimPrefix(release.TagName, "v")
+	current := strings.TrimPrefix(version, "v")
+
+	if latest == "" || latest == current || current == "dev" {
+		return ""
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+
+	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/vectorscan-darwin-%s", repo, release.TagName, goarch)
+
+	resp2, err := client.Get(url)
+	if err != nil || resp2.StatusCode != 200 {
+		return ""
+	}
+	defer resp2.Body.Close()
+
+	tmp, err := os.CreateTemp("", "vectorscan-update-*")
+	if err != nil {
+		return ""
+	}
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.ReadFrom(resp2.Body); err != nil {
+		tmp.Close()
+		return ""
+	}
+	tmp.Close()
+
+	if err := os.Chmod(tmp.Name(), 0755); err != nil {
+		return ""
+	}
+	if err := os.Rename(tmp.Name(), exe); err != nil {
+		return ""
+	}
+
+	return fmt.Sprintf("Updated vectorscan v%s → v%s", current, latest)
 }
 
 func printHelp() {
