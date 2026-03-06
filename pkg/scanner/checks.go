@@ -1389,7 +1389,7 @@ func (s *Scanner) checkCoreDumps(ctx context.Context) (*models.Finding, error) {
 			Severity:    models.SeverityMedium,
 			Title:       "Core dumps enabled",
 			Description: "Core dumps are enabled. These files can contain sensitive memory information.",
-			Remediation: "Disable core dumps: Add 'limit core 0 0' to appropriate launch configuration or use: ulimit -c 0",
+			Remediation: "To permanently disable core dumps on macOS, create /Library/LaunchDaemons/limit.corefile.plist with a core limit of 0, then load it with: sudo launchctl load /Library/LaunchDaemons/limit.corefile.plist. For a session-only fix: ulimit -c 0",
 			Evidence:    []string{"Core dump limit is unlimited or large"},
 			Timestamp:   time.Now(),
 		}, nil
