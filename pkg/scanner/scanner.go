@@ -32,11 +32,16 @@ type ProgressUpdate struct {
 // New creates a new scanner for the current platform
 func New() (*Scanner, error) {
 	plat := runtime.GOOS
-	if plat != "darwin" {
-		return nil, fmt.Errorf("unsupported platform: %s (currently macOS only)", plat)
-	}
 
-	pu := platform.NewMacOS()
+	var pu platform.Platform
+	switch plat {
+	case "darwin":
+		pu = platform.NewMacOS()
+	case "linux":
+		pu = platform.NewLinux()
+	default:
+		return nil, fmt.Errorf("unsupported platform: %s (macOS and Linux supported)", plat)
+	}
 
 	hostname, _ := os.Hostname()
 
@@ -97,11 +102,15 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 		defer close(s.progressChan)
 
 		checkNum := 0
-		// Base checks (non-platform-specific) + macOS-specific checks
-		// 53 base checks + 9 macOS-specific checks = 62
-		totalChecks := 53
-		if s.platform == "darwin" {
-			totalChecks += 9
+		// 23 cross-platform base checks
+		// darwin: +39 macOS-specific = 62 total
+		// linux:  +7  Linux-specific = 30 total
+		totalChecks := 23
+		switch s.platform {
+		case "darwin":
+			totalChecks += 39
+		case "linux":
+			totalChecks += 7
 		}
 
 		// Helper to report progress (respects context cancellation)
@@ -144,7 +153,9 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 			}
 		}
 
-		// Permissions checks
+		// ── Cross-platform base checks (23) ─────────────────────────────────
+
+		// Permissions
 		reportProgress("Sudoers configuration")
 		if f, err := s.checkSudoersConfig(scanCtx); err == nil && f != nil {
 			findings <- *f
@@ -158,53 +169,13 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 			findings <- *f
 		}
 
-		// System checks (macOS-specific)
-		if s.platform == "darwin" {
-			reportProgress("System Integrity Protection")
-			if f, err := s.checkSIP(scanCtx); err == nil && f != nil {
-				findings <- *f
-			}
-			reportProgress("Gatekeeper")
-			if f, err := s.checkGatekeeper(scanCtx); err == nil && f != nil {
-				findings <- *f
-			}
-			reportProgress("Firewall")
-			if f, err := s.checkFirewall(scanCtx); err == nil && f != nil {
-				findings <- *f
-			}
-			reportProgress("Password policy")
-			if f, err := s.checkPasswordPolicy(scanCtx); err == nil && f != nil {
-				findings <- *f
-			}
-			reportProgress("FileVault status")
-			if f, err := s.checkFileVaultStatus(scanCtx); err == nil && f != nil {
-				findings <- *f
-			}
-			reportProgress("Screen lock timeout")
-			if f, err := s.checkScreenLockTimeout(scanCtx); err == nil && f != nil {
-				findings <- *f
-			}
-			reportProgress("Guest account")
-			if f, err := s.checkGuestAccountEnabled(scanCtx); err == nil && f != nil {
-				findings <- *f
-			}
-			reportProgress("Automatic login")
-			if f, err := s.checkAutomaticLoginEnabled(scanCtx); err == nil && f != nil {
-				findings <- *f
-			}
-			reportProgress("XProtect")
-			if f, err := s.checkXProtectStatus(scanCtx); err == nil && f != nil {
-				findings <- *f
-			}
-		}
-
-		// Network checks
+		// Network
 		reportProgress("Open ports")
 		if f, err := s.checkOpenPorts(scanCtx); err == nil && f != nil {
 			findings <- *f
 		}
 
-		// SSH checks
+		// SSH
 		reportProgress("SSH configuration")
 		if f, err := s.checkSSHConfig(scanCtx); err == nil && f != nil {
 			findings <- *f
@@ -217,8 +188,20 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 		if f, err := s.checkSSHStrictHostKeyChecking(scanCtx); err == nil && f != nil {
 			findings <- *f
 		}
+		reportProgress("Root SSH login")
+		if f, err := s.checkRootSSHLogin(scanCtx); err == nil && f != nil {
+			findings <- *f
+		}
+		reportProgress("SSH key algorithms")
+		if f, err := s.checkSSHKeyAlgorithms(scanCtx); err == nil && f != nil {
+			findings <- *f
+		}
+		reportProgress("Weak ciphers")
+		if f, err := s.checkWeakCiphers(scanCtx); err == nil && f != nil {
+			findings <- *f
+		}
 
-		// Privilege escalation checks
+		// Privilege escalation
 		reportProgress("PATH hijacking")
 		if f, err := s.checkPATHHijacking(scanCtx); err == nil && f != nil {
 			findings <- *f
@@ -228,83 +211,21 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 			findings <- *f
 		}
 
-		// Persistence checks
-		reportProgress("Launch agents permissions")
-		if f, err := s.checkLaunchAgentsPermissions(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
+		// Files & credentials
 		reportProgress("Shell config permissions")
 		if f, err := s.checkShellConfigPermissions(scanCtx); err == nil && f != nil {
 			findings <- *f
 		}
-
-		// Credentials checks
 		reportProgress("Credentials in home directory")
 		if f, err := s.checkCredentialsInHome(scanCtx); err == nil && f != nil {
 			findings <- *f
 		}
-
-		// Development/Git checks
 		reportProgress("Git configuration security")
 		if f, err := s.checkGitConfigSecurity(scanCtx); err == nil && f != nil {
 			findings <- *f
 		}
 
-		// High-priority system checks
-		reportProgress("System updates")
-		if f := runCheckWithTimeout("System updates", s.checkSystemUpdates, 3*time.Second); f != nil {
-			findings <- *f
-		}
-		reportProgress("Bluetooth discoverability")
-		if f, err := s.checkBluetoothDiscoverability(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("Microphone and camera access")
-		if f := runCheckWithTimeout("Microphone and camera access", s.checkMicrophoneCamera, 5*time.Second); f != nil {
-			findings <- *f
-		}
-		reportProgress("Touch ID for sudo")
-		if f, err := s.checkTouchIDForSudo(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("SSH service status")
-		if f, err := s.checkSSHServiceStatus(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("VPN status")
-		if f, err := s.checkVPNStatus(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("DNS over HTTPS")
-		if f, err := s.checkDNSOverHTTPS(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("Browser security")
-		if f, err := s.checkBrowserSecurity(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("iCloud Keychain")
-		if f, err := s.checkiCloudKeychain(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("Apple ID 2FA")
-		if f, err := s.checkAppleID2FA(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("WiFi password storage")
-		if f, err := s.checkWiFiPasswordStorage(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("Secure boot (T2)")
-		if f, err := s.checkSecureBootT2(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-
-		// System & Authentication checks
-		reportProgress("Root SSH login")
-		if f, err := s.checkRootSSHLogin(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
+		// Authentication
 		reportProgress("Empty password accounts")
 		if f, err := s.checkEmptyPasswordAccounts(scanCtx); err == nil && f != nil {
 			findings <- *f
@@ -317,124 +238,234 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 		if f, err := s.checkAccountLockout(scanCtx); err == nil && f != nil {
 			findings <- *f
 		}
-		reportProgress("Login window security")
-		if f, err := s.checkLoginWindowSecurity(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
 
-		// Kernel & Core checks
-		reportProgress("Kernel extensions")
-		if f, err := s.checkKernelExtensions(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("Kernel panic auto-reboot")
-		if f, err := s.checkKernelPanicAutoReboot(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
+		// Kernel & system
 		reportProgress("Core dumps")
 		if f, err := s.checkCoreDumps(scanCtx); err == nil && f != nil {
 			findings <- *f
 		}
 
-		// Privacy & Access Control checks
-		reportProgress("Accessibility permissions")
-		if f, err := s.checkAccessibilityPermissions(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("Location services")
-		if f, err := s.checkLocationServices(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("Spotlight indexing")
-		if f, err := s.checkSpotlightIndexing(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("App Store unknown sources")
-		if f, err := s.checkAppStoreUnknownSources(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("Notarization")
-		if f, err := s.checkNotarization(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-
-		// Network & Encryption checks
-		reportProgress("SSH key algorithms")
-		if f, err := s.checkSSHKeyAlgorithms(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("Weak ciphers")
-		if f, err := s.checkWeakCiphers(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("DNSSEC validation")
-		if f, err := s.checkDNSSECValidation(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("Bonjour/mDNS")
-		if f, err := s.checkBonjourMDNS(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-
-		// Logging & Monitoring checks
+		// Logging
 		reportProgress("Audit logging")
 		if f, err := s.checkAuditLogging(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-		reportProgress("System log retention")
-		if f, err := s.checkSystemLogRetention(scanCtx); err == nil && f != nil {
 			findings <- *f
 		}
 		reportProgress("Syslog forwarding")
 		if f, err := s.checkSyslogForwarding(scanCtx); err == nil && f != nil {
 			findings <- *f
 		}
-		reportProgress("Crash reporter")
-		if f, err := s.checkCrashReporter(scanCtx); err == nil && f != nil {
-			findings <- *f
-		}
-
-		// System Configuration checks
-		reportProgress("Sleep idle timeout")
-		if f, err := s.checkSleepIdleTimeout(scanCtx); err == nil && f != nil {
+		reportProgress("DNSSEC validation")
+		if f, err := s.checkDNSSECValidation(scanCtx); err == nil && f != nil {
 			findings <- *f
 		}
 		reportProgress("Time synchronization")
 		if f, err := s.checkTimeSync(scanCtx); err == nil && f != nil {
 			findings <- *f
 		}
-		reportProgress("Firmware updates")
-		if f := runCheckWithTimeout("Firmware updates", s.checkFirmwareUpdates, 5*time.Second); f != nil {
-			findings <- *f
-		}
-		// TODO: Fix hanging defaults read - reads multiple plist files (Safari, Chrome) (check if application auto-updates enabled)
-		// reportProgress("Application auto-updates")
-		// if f, err := s.checkApplicationAutoUpdates(scanCtx); err == nil && f != nil {
-		// 	findings <- *f
-		// }
-		// TODO: Fix hanging defaults read - macOS defaults command blocks on plist files (check if remote management/screen sharing is disabled)
-		// reportProgress("Remote management")
-		// if f := runCheckWithTimeout("Remote management", s.checkRemoteManagement, 3*time.Second); f != nil {
-		// 	findings <- *f
-		// }
 
-		// Privacy & Telemetry checks
-		// Privacy & Telemetry checks (using plutil instead of defaults read to avoid cfprefsd hangs)
-		reportProgress("Spotlight telemetry")
-		if f := runCheckWithTimeout("Spotlight telemetry", s.checkSpotlightTelemetry, 3*time.Second); f != nil {
-			findings <- *f
+		// ── macOS-specific checks (39) ────────────────────────────────────
+		if s.platform == "darwin" {
+			// System integrity
+			reportProgress("System Integrity Protection")
+			if f, err := s.checkSIP(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Gatekeeper")
+			if f, err := s.checkGatekeeper(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("XProtect")
+			if f, err := s.checkXProtectStatus(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Notarization")
+			if f, err := s.checkNotarization(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Secure boot (T2)")
+			if f, err := s.checkSecureBootT2(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Firmware updates")
+			if f := runCheckWithTimeout("Firmware updates", s.checkFirmwareUpdates, 5*time.Second); f != nil {
+				findings <- *f
+			}
+			reportProgress("System updates")
+			if f := runCheckWithTimeout("System updates", s.checkSystemUpdates, 3*time.Second); f != nil {
+				findings <- *f
+			}
+
+			// Encryption & auth
+			reportProgress("FileVault status")
+			if f, err := s.checkFileVaultStatus(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Password policy")
+			if f, err := s.checkPasswordPolicy(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Touch ID for sudo")
+			if f, err := s.checkTouchIDForSudo(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Login window security")
+			if f, err := s.checkLoginWindowSecurity(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Guest account")
+			if f, err := s.checkGuestAccountEnabled(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Automatic login")
+			if f, err := s.checkAutomaticLoginEnabled(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Screen lock timeout")
+			if f, err := s.checkScreenLockTimeout(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Sleep idle timeout")
+			if f, err := s.checkSleepIdleTimeout(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Network
+			reportProgress("Firewall")
+			if f, err := s.checkFirewall(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("SSH service status")
+			if f, err := s.checkSSHServiceStatus(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("VPN status")
+			if f, err := s.checkVPNStatus(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("DNS over HTTPS")
+			if f, err := s.checkDNSOverHTTPS(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Bonjour/mDNS")
+			if f, err := s.checkBonjourMDNS(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Bluetooth discoverability")
+			if f, err := s.checkBluetoothDiscoverability(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Privacy & access
+			reportProgress("Microphone and camera access")
+			if f := runCheckWithTimeout("Microphone and camera access", s.checkMicrophoneCamera, 5*time.Second); f != nil {
+				findings <- *f
+			}
+			reportProgress("Accessibility permissions")
+			if f, err := s.checkAccessibilityPermissions(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Location services")
+			if f, err := s.checkLocationServices(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("iCloud Keychain")
+			if f, err := s.checkiCloudKeychain(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Apple ID 2FA")
+			if f, err := s.checkAppleID2FA(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("WiFi password storage")
+			if f, err := s.checkWiFiPasswordStorage(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Browser security")
+			if f, err := s.checkBrowserSecurity(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Telemetry
+			reportProgress("Spotlight telemetry")
+			if f := runCheckWithTimeout("Spotlight telemetry", s.checkSpotlightTelemetry, 3*time.Second); f != nil {
+				findings <- *f
+			}
+			reportProgress("Siri analytics")
+			if f := runCheckWithTimeout("Siri analytics", s.checkSiriAnalytics, 3*time.Second); f != nil {
+				findings <- *f
+			}
+			reportProgress("Apple analytics")
+			if f := runCheckWithTimeout("Apple analytics", s.checkAppleAnalytics, 3*time.Second); f != nil {
+				findings <- *f
+			}
+			reportProgress("Third-party data sharing")
+			if f := runCheckWithTimeout("Third-party data sharing", s.checkThirdPartyDataSharing, 3*time.Second); f != nil {
+				findings <- *f
+			}
+
+			// Kernel & persistence
+			reportProgress("Kernel extensions")
+			if f, err := s.checkKernelExtensions(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Kernel panic auto-reboot")
+			if f, err := s.checkKernelPanicAutoReboot(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Launch agents permissions")
+			if f, err := s.checkLaunchAgentsPermissions(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Logging
+			reportProgress("System log retention")
+			if f, err := s.checkSystemLogRetention(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Crash reporter")
+			if f, err := s.checkCrashReporter(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Spotlight indexing")
+			if f, err := s.checkSpotlightIndexing(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("App Store unknown sources")
+			if f, err := s.checkAppStoreUnknownSources(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
 		}
-		reportProgress("Siri analytics")
-		if f := runCheckWithTimeout("Siri analytics", s.checkSiriAnalytics, 3*time.Second); f != nil {
-			findings <- *f
-		}
-		reportProgress("Apple analytics")
-		if f := runCheckWithTimeout("Apple analytics", s.checkAppleAnalytics, 3*time.Second); f != nil {
-			findings <- *f
-		}
-		reportProgress("Third-party data sharing")
-		if f := runCheckWithTimeout("Third-party data sharing", s.checkThirdPartyDataSharing, 3*time.Second); f != nil {
-			findings <- *f
+
+		// ── Linux-specific checks (7) ─────────────────────────────────────
+		if s.platform == "linux" {
+			reportProgress("Firewall")
+			if f, err := s.checkFirewallLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Mandatory access control")
+			if f, err := s.checkAppArmorSELinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Disk encryption (LUKS)")
+			if f, err := s.checkLUKSEncryption(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Automatic security updates")
+			if f, err := s.checkAutoUpdatesLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("SSH service status")
+			if f, err := s.checkSSHServiceLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Kernel hardening")
+			if f, err := s.checkKernelHardeningLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Password policy (PAM)")
+			if f, err := s.checkPasswordPolicyLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
 		}
 	}()
 

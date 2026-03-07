@@ -13,7 +13,7 @@
 
 Fast, opinionated system security audit tool. Scans your Mac for misconfigurations, weak defaults, and attack vectors — then tells you exactly what to fix. No agents, no cloud, no telemetry. Just a binary and the truth.
 
-Currently macOS only. Linux and Windows support coming soon.
+macOS and Linux supported. Windows coming soon.
 
 ```
 $ sudo vectorscan
@@ -159,7 +159,7 @@ Earned:              180 pts → 81%
 
 ## What you need
 
-- macOS (darwin)
+- macOS or Linux
 - 10 seconds
 
 ---

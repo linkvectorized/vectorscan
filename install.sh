@@ -17,7 +17,8 @@ esac
 
 case "$OS" in
   darwin) ;;
-  *) echo "Unsupported OS: $OS (only macOS is currently supported)" >&2; exit 1 ;;
+  linux) ;;
+  *) echo "Unsupported OS: $OS (macOS and Linux supported)" >&2; exit 1 ;;
 esac
 
 ASSET="${BIN_NAME}-${OS}-${ARCH}"
@@ -39,7 +40,11 @@ curl -fsSL "$URL" -o "/tmp/${BIN_NAME}"
 chmod +x "/tmp/${BIN_NAME}"
 
 echo "Installing to ${INSTALL_DIR}/${BIN_NAME} (may require sudo)..."
-sudo mv "/tmp/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+if [ -w "${INSTALL_DIR}" ]; then
+  mv "/tmp/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+else
+  sudo mv "/tmp/${BIN_NAME}" "${INSTALL_DIR}/${BIN_NAME}"
+fi
 
 echo ""
 echo "Done. Run: vectorscan --help"
