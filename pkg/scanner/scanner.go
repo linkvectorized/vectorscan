@@ -104,13 +104,13 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 		checkNum := 0
 		// 23 cross-platform base checks
 		// darwin: +39 macOS-specific = 62 total
-		// linux:  +7  Linux-specific = 30 total
+		// linux:  +25 Linux-specific = 48 total
 		totalChecks := 23
 		switch s.platform {
 		case "darwin":
 			totalChecks += 39
 		case "linux":
-			totalChecks += 7
+			totalChecks += 25
 		}
 
 		// Helper to report progress (respects context cancellation)
@@ -464,6 +464,90 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 			}
 			reportProgress("Password policy (PAM)")
 			if f, err := s.checkPasswordPolicyLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Authentication & access
+			reportProgress("Root account locked")
+			if f, err := s.checkRootAccountLocked(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Shell accounts")
+			if f, err := s.checkShellAccountsLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Sudo logging")
+			if f, err := s.checkSudoLoggingLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Authorized keys permissions")
+			if f, err := s.checkAuthorizedKeysPerms(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Network
+			reportProgress("IPv6 configuration")
+			if f, err := s.checkIPv6Linux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Listening services")
+			if f, err := s.checkListeningServicesLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("ARP spoofing protection")
+			if f, err := s.checkARPProtection(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// System integrity
+			reportProgress("GRUB bootloader password")
+			if f, err := s.checkGRUBPassword(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Sticky bit on temp directories")
+			if f, err := s.checkStickyBitLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Cron directory permissions")
+			if f, err := s.checkCronPermissions(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Immutable system files")
+			if f, err := s.checkImmutableFiles(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Persistence
+			reportProgress("Systemd user units")
+			if f, err := s.checkSystemdUserUnits(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("rc.local and init scripts")
+			if f, err := s.checkRCLocal(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("World-writable cron paths")
+			if f, err := s.checkWorldWritableCron(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Privacy & telemetry
+			reportProgress("systemd-coredump")
+			if f, err := s.checkCoredumpLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Apport crash reporter")
+			if f, err := s.checkApportLinux(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Logging
+			reportProgress("Journald persistence")
+			if f, err := s.checkJournaldPersistence(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Log tamper protection")
+			if f, err := s.checkLogTampering(scanCtx); err == nil && f != nil {
 				findings <- *f
 			}
 		}

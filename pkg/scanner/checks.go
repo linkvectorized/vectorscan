@@ -2194,3 +2194,513 @@ func (s *Scanner) checkPasswordPolicyLinux(ctx context.Context) (*models.Finding
 		Timestamp:   time.Now(),
 	}, nil
 }
+
+// ── Additional Linux checks ───────────────────────────────────────────────────
+
+// checkRootAccountLocked checks that direct root login is disabled
+func (s *Scanner) checkRootAccountLocked(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "sh", "-c",
+		`passwd -S root 2>/dev/null | awk '{print $2}'`)
+	if err == nil {
+		status := strings.TrimSpace(out)
+		// L = locked, NP = no password (also locked effectively)
+		if status == "L" || status == "NP" {
+			return positiveAuditFinding("AUTH-010-OK", "Root account locked ✓", "Direct root login disabled", "Root account not directly accessible"), nil
+		}
+		if status == "P" {
+			return &models.Finding{
+				ID:          "AUTH-010",
+				Category:    "authentication",
+				Severity:    models.SeverityHigh,
+				Title:       "Root account has active password",
+				Description: "The root account has a password set and can be logged into directly. Use sudo instead.",
+				Remediation: "Lock the root account: sudo passwd -l root",
+				Evidence:    []string{"passwd -S root reports status: P (active password)"},
+				Timestamp:   time.Now(),
+			}, nil
+		}
+	}
+	return nil, nil
+}
+
+// checkShellAccountsLinux checks for non-system accounts with interactive shells that should not have them
+func (s *Scanner) checkShellAccountsLinux(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "sh", "-c",
+		`awk -F: '($3 >= 1000 && $7 != "/usr/sbin/nologin" && $7 != "/bin/false" && $7 != "/sbin/nologin") {print $1}' /etc/passwd 2>/dev/null`)
+	if err != nil {
+		return nil, nil
+	}
+	accounts := []string{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			accounts = append(accounts, line)
+		}
+	}
+	if len(accounts) > 5 {
+		return &models.Finding{
+			ID:          "AUTH-011",
+			Category:    "authentication",
+			Severity:    models.SeverityMedium,
+			Title:       "Excessive accounts with shell access",
+			Description: fmt.Sprintf("%d user accounts have interactive shell access. Review and disable shells for service accounts.", len(accounts)),
+			Remediation: "For service accounts that don't need login: sudo usermod -s /usr/sbin/nologin <username>",
+			Evidence:    accounts,
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("AUTH-011-OK", "Shell account access reasonable ✓", "User shell accounts within expected range", "Login access appropriately scoped"), nil
+}
+
+// checkSudoLoggingLinux checks that sudo activity is being logged
+func (s *Scanner) checkSudoLoggingLinux(ctx context.Context) (*models.Finding, error) {
+	// Check that auth log exists and is non-empty
+	if s.platform_util.FileExists("/var/log/auth.log") {
+		perms, _ := s.platform_util.GetFilePermissions("/var/log/auth.log")
+		if perms != "" {
+			return positiveAuditFinding("AUDIT-010-OK", "Sudo logging active ✓", "/var/log/auth.log present", "Privilege escalation events recorded"), nil
+		}
+	}
+	// RHEL uses /var/log/secure
+	if s.platform_util.FileExists("/var/log/secure") {
+		return positiveAuditFinding("AUDIT-010-OK", "Sudo logging active ✓", "/var/log/secure present", "Privilege escalation events recorded"), nil
+	}
+	// systemd journals catch it too
+	if out, err := s.platform_util.RunCommand(ctx, "journalctl", "-u", "sudo", "--no-pager", "-n", "1"); err == nil && strings.TrimSpace(out) != "" {
+		return positiveAuditFinding("AUDIT-010-OK", "Sudo logging active ✓", "journald capturing sudo events", "Privilege escalation events recorded"), nil
+	}
+	return &models.Finding{
+		ID:          "AUDIT-010",
+		Category:    "audit",
+		Severity:    models.SeverityMedium,
+		Title:       "Sudo activity may not be logged",
+		Description: "No auth log or sudo journal entries found. Privilege escalation may go unrecorded.",
+		Remediation: "Ensure rsyslog or syslog-ng is running and writing to /var/log/auth.log",
+		Evidence:    []string{"/var/log/auth.log absent", "/var/log/secure absent"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkAuthorizedKeysPerms checks SSH authorized_keys file permissions for all users
+func (s *Scanner) checkAuthorizedKeysPerms(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "sh", "-c",
+		`find /home /root -name "authorized_keys" 2>/dev/null`)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return positiveAuditFinding("SSH-010-OK", "No authorized_keys files found ✓", "No SSH key authorization files present", "SSH key attack surface absent"), nil
+	}
+	issues := []string{}
+	for _, path := range strings.Split(strings.TrimSpace(out), "\n") {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		perms, err := s.platform_util.GetFilePermissions(path)
+		if err != nil {
+			continue
+		}
+		// authorized_keys should be 600 or 640 at most
+		if len(perms) >= 3 && perms[len(perms)-2:] != "00" && perms[len(perms)-1:] != "0" {
+			last := perms[len(perms)-1]
+			if last != '0' {
+				issues = append(issues, fmt.Sprintf("%s (perms: %s)", path, perms))
+			}
+		}
+	}
+	if len(issues) > 0 {
+		return &models.Finding{
+			ID:          "SSH-010",
+			Category:    "network",
+			Severity:    models.SeverityMedium,
+			Title:       "authorized_keys files have insecure permissions",
+			Description: "SSH authorized_keys files are readable or writable by others.",
+			Remediation: "Fix permissions: chmod 600 ~/.ssh/authorized_keys",
+			Evidence:    issues,
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("SSH-010-OK", "authorized_keys permissions secure ✓", "SSH key files properly restricted", "SSH key files protected"), nil
+}
+
+// checkIPv6Linux checks if IPv6 is disabled when not in use
+func (s *Scanner) checkIPv6Linux(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "sysctl", "-n", "net.ipv6.conf.all.disable_ipv6")
+	if err == nil && strings.TrimSpace(out) == "1" {
+		return positiveAuditFinding("NET-010-OK", "IPv6 disabled ✓", "net.ipv6.conf.all.disable_ipv6=1", "IPv6 attack surface removed"), nil
+	}
+	// IPv6 active — check if any IPv6 addresses are actually assigned
+	addrs, _ := s.platform_util.RunCommand(ctx, "sh", "-c", `ip -6 addr show 2>/dev/null | grep "inet6" | grep -v "::1"`)
+	if strings.TrimSpace(addrs) == "" {
+		return positiveAuditFinding("NET-010-OK", "IPv6 enabled but no addresses assigned ✓", "No external IPv6 addresses active", "IPv6 exposure minimal"), nil
+	}
+	return &models.Finding{
+		ID:          "NET-010",
+		Category:    "network",
+		Severity:    models.SeverityLow,
+		Title:       "IPv6 enabled and active",
+		Description: "IPv6 is active on this host. If not required, disabling it reduces attack surface.",
+		Remediation: "To disable IPv6: add 'net.ipv6.conf.all.disable_ipv6 = 1' to /etc/sysctl.d/99-hardening.conf and run: sudo sysctl --system",
+		Evidence:    []string{strings.TrimSpace(addrs)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkListeningServicesLinux checks for services listening on all interfaces unnecessarily
+func (s *Scanner) checkListeningServicesLinux(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "sh", "-c",
+		`ss -tlnp 2>/dev/null | grep "0.0.0.0:" | grep -v "127.0.0.1"`)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return positiveAuditFinding("NET-011-OK", "No services exposed on all interfaces ✓", "All listeners bound to localhost or specific IPs", "Service exposure minimised"), nil
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	return &models.Finding{
+		ID:          "NET-011",
+		Category:    "network",
+		Severity:    models.SeverityMedium,
+		Title:       "Services listening on all interfaces",
+		Description: fmt.Sprintf("%d service(s) are bound to 0.0.0.0 and accept connections from any address.", len(lines)),
+		Remediation: "Bind services to 127.0.0.1 if they only need local access. Review each service's configuration.",
+		Evidence:    lines,
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkARPProtection checks sysctl ARP spoofing mitigations
+func (s *Scanner) checkARPProtection(ctx context.Context) (*models.Finding, error) {
+	issues := []string{}
+	checks := map[string]string{
+		"net.ipv4.conf.all.arp_ignore":    "1",
+		"net.ipv4.conf.all.arp_announce":  "2",
+	}
+	for key, want := range checks {
+		out, err := s.platform_util.RunCommand(ctx, "sysctl", "-n", key)
+		if err == nil && strings.TrimSpace(out) != want {
+			issues = append(issues, fmt.Sprintf("%s=%s (want %s)", key, strings.TrimSpace(out), want))
+		}
+	}
+	if len(issues) > 0 {
+		return &models.Finding{
+			ID:          "NET-012",
+			Category:    "network",
+			Severity:    models.SeverityLow,
+			Title:       "ARP spoofing protections not configured",
+			Description: "Kernel ARP hardening parameters are not set, leaving the host more susceptible to ARP spoofing attacks.",
+			Remediation: "Add to /etc/sysctl.d/99-hardening.conf:\nnet.ipv4.conf.all.arp_ignore = 1\nnet.ipv4.conf.all.arp_announce = 2",
+			Evidence:    issues,
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("NET-012-OK", "ARP spoofing protections configured ✓", "arp_ignore and arp_announce hardened", "ARP attack surface reduced"), nil
+}
+
+// checkGRUBPassword checks if the GRUB bootloader is password protected
+func (s *Scanner) checkGRUBPassword(ctx context.Context) (*models.Finding, error) {
+	paths := []string{
+		"/boot/grub/grub.cfg",
+		"/boot/grub2/grub.cfg",
+		"/boot/efi/EFI/fedora/grub.cfg",
+	}
+	for _, path := range paths {
+		if !s.platform_util.FileExists(path) {
+			continue
+		}
+		content, err := s.platform_util.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if strings.Contains(content, "password_pbkdf2") || strings.Contains(content, "password --md5") {
+			return positiveAuditFinding("BOOT-010-OK", "GRUB password set ✓", "Bootloader is password protected", "Boot-time tampering prevented"), nil
+		}
+		return &models.Finding{
+			ID:          "BOOT-010",
+			Category:    "system",
+			Severity:    models.SeverityMedium,
+			Title:       "GRUB bootloader has no password",
+			Description: "Anyone with physical access can boot into single-user mode or modify kernel parameters without authentication.",
+			Remediation: "Set a GRUB password: sudo grub-mkpasswd-pbkdf2  then add the hash to /etc/grub.d/40_custom and run: sudo update-grub",
+			Evidence:    []string{fmt.Sprintf("No password directive found in %s", path)},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return nil, nil
+}
+
+// checkStickyBitLinux checks that /tmp and /var/tmp have the sticky bit set
+func (s *Scanner) checkStickyBitLinux(ctx context.Context) (*models.Finding, error) {
+	dirs := []string{"/tmp", "/var/tmp"}
+	issues := []string{}
+	for _, dir := range dirs {
+		out, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("stat -c %%a %s 2>/dev/null", dir))
+		if err != nil {
+			continue
+		}
+		perms := strings.TrimSpace(out)
+		// Sticky bit is present when the leading digit is 1 (e.g. 1777)
+		if len(perms) < 4 || perms[0] != '1' {
+			issues = append(issues, fmt.Sprintf("%s (perms: %s, sticky bit missing)", dir, perms))
+		}
+	}
+	if len(issues) > 0 {
+		return &models.Finding{
+			ID:          "PERM-010",
+			Category:    "permissions",
+			Severity:    models.SeverityMedium,
+			Title:       "Sticky bit missing on temp directories",
+			Description: "World-writable directories without the sticky bit allow users to delete each other's files.",
+			Remediation: "Set sticky bit: sudo chmod +t /tmp /var/tmp",
+			Evidence:    issues,
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("PERM-010-OK", "Sticky bit set on temp directories ✓", "/tmp and /var/tmp properly restricted", "Temp directory access controlled"), nil
+}
+
+// checkCronPermissions checks that cron directories are owned by root and not world-writable
+func (s *Scanner) checkCronPermissions(ctx context.Context) (*models.Finding, error) {
+	cronPaths := []string{"/etc/cron.d", "/etc/cron.daily", "/etc/cron.hourly", "/etc/cron.weekly", "/etc/cron.monthly", "/etc/crontab"}
+	issues := []string{}
+	for _, path := range cronPaths {
+		if !s.platform_util.FileExists(path) {
+			continue
+		}
+		out, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("stat -c '%%U %%a' %s 2>/dev/null", path))
+		if err != nil {
+			continue
+		}
+		parts := strings.Fields(strings.TrimSpace(out))
+		if len(parts) < 2 {
+			continue
+		}
+		owner, perms := parts[0], parts[1]
+		if owner != "root" {
+			issues = append(issues, fmt.Sprintf("%s owned by %s (should be root)", path, owner))
+		}
+		if len(perms) > 0 && perms[len(perms)-1] != '0' {
+			issues = append(issues, fmt.Sprintf("%s is world-writable (perms: %s)", path, perms))
+		}
+	}
+	if len(issues) > 0 {
+		return &models.Finding{
+			ID:          "PERM-011",
+			Category:    "permissions",
+			Severity:    models.SeverityHigh,
+			Title:       "Insecure cron directory permissions",
+			Description: "Cron paths are not owned by root or are world-writable. Attackers can inject persistent commands.",
+			Remediation: "Fix ownership and permissions: sudo chown root:root /etc/cron.* && sudo chmod og-w /etc/cron.*",
+			Evidence:    issues,
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("PERM-011-OK", "Cron directory permissions secure ✓", "All cron paths root-owned and restricted", "Cron persistence injection prevented"), nil
+}
+
+// checkImmutableFiles checks critical system files for immutable flag via lsattr
+func (s *Scanner) checkImmutableFiles(ctx context.Context) (*models.Finding, error) {
+	critical := []string{"/etc/passwd", "/etc/shadow", "/etc/group", "/etc/sudoers"}
+	missing := []string{}
+	for _, path := range critical {
+		if !s.platform_util.FileExists(path) {
+			continue
+		}
+		out, err := s.platform_util.RunCommand(ctx, "lsattr", path)
+		if err != nil {
+			continue
+		}
+		// lsattr output: "----i--------e-- /etc/passwd" — 'i' flag = immutable
+		if !strings.Contains(out, "i") {
+			missing = append(missing, path)
+		}
+	}
+	if len(missing) > 0 {
+		return &models.Finding{
+			ID:          "PERM-012",
+			Category:    "permissions",
+			Severity:    models.SeverityLow,
+			Title:       "Critical files not marked immutable",
+			Description: "Key system files lack the immutable flag. Root can still modify them without explicitly clearing the flag first.",
+			Remediation: "Set immutable flag: sudo chattr +i /etc/passwd /etc/shadow /etc/group /etc/sudoers  (remember to unset before making legitimate changes: chattr -i)",
+			Evidence:    missing,
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("PERM-012-OK", "Critical files marked immutable ✓", "chattr +i set on key system files", "Unauthorised file modification prevented"), nil
+}
+
+// checkSystemdUserUnits checks for suspicious systemd units in user-writable directories
+func (s *Scanner) checkSystemdUserUnits(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "sh", "-c",
+		`find /home /tmp /var/tmp -name "*.service" -o -name "*.timer" 2>/dev/null | head -20`)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return positiveAuditFinding("PERSIST-010-OK", "No systemd units in user directories ✓", "No service/timer files in writable paths", "Systemd persistence injection absent"), nil
+	}
+	units := strings.Split(strings.TrimSpace(out), "\n")
+	return &models.Finding{
+		ID:          "PERSIST-010",
+		Category:    "persistence",
+		Severity:    models.SeverityHigh,
+		Title:       "Systemd unit files found in user-writable directories",
+		Description: fmt.Sprintf("%d systemd unit file(s) found outside system directories. Could indicate persistence backdoor.", len(units)),
+		Remediation: "Review each file and remove if not legitimate. Systemd units should live in /etc/systemd/system/ or /usr/lib/systemd/system/",
+		Evidence:    units,
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkRCLocal checks /etc/rc.local for suspicious content
+func (s *Scanner) checkRCLocal(ctx context.Context) (*models.Finding, error) {
+	if !s.platform_util.FileExists("/etc/rc.local") {
+		return positiveAuditFinding("PERSIST-011-OK", "/etc/rc.local absent ✓", "Legacy init script not present", "No rc.local persistence vector"), nil
+	}
+	content, err := s.platform_util.ReadFile("/etc/rc.local")
+	if err != nil {
+		return nil, nil
+	}
+	// Strip comments and blank lines
+	active := []string{}
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || line == "exit 0" {
+			continue
+		}
+		active = append(active, line)
+	}
+	if len(active) > 0 {
+		return &models.Finding{
+			ID:          "PERSIST-011",
+			Category:    "persistence",
+			Severity:    models.SeverityMedium,
+			Title:       "/etc/rc.local contains active commands",
+			Description: "/etc/rc.local runs at boot and contains non-comment entries. Review for legitimacy.",
+			Remediation: "Review each entry in /etc/rc.local and migrate legitimate services to systemd units. Remove unknown entries.",
+			Evidence:    active,
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("PERSIST-011-OK", "/etc/rc.local empty ✓", "No active boot commands in rc.local", "Legacy init persistence vector clean"), nil
+}
+
+// checkWorldWritableCron checks for world-writable files inside cron directories
+func (s *Scanner) checkWorldWritableCron(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "sh", "-c",
+		`find /etc/cron.d /etc/cron.daily /etc/cron.hourly /etc/cron.weekly /etc/cron.monthly -maxdepth 1 -perm -o+w 2>/dev/null`)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return positiveAuditFinding("PERM-013-OK", "No world-writable cron files ✓", "Cron job files not writable by others", "Cron injection prevented"), nil
+	}
+	files := strings.Split(strings.TrimSpace(out), "\n")
+	return &models.Finding{
+		ID:          "PERM-013",
+		Category:    "permissions",
+		Severity:    models.SeverityHigh,
+		Title:       "World-writable files in cron directories",
+		Description: fmt.Sprintf("%d file(s) in cron directories are world-writable and can be modified by any user.", len(files)),
+		Remediation: "Remove world-write permission: sudo chmod o-w <file>",
+		Evidence:    files,
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkCoredumpLinux checks if systemd-coredump is enabled and configured securely
+func (s *Scanner) checkCoredumpLinux(ctx context.Context) (*models.Finding, error) {
+	// Check if coredump is being sent somewhere external
+	if s.platform_util.FileExists("/etc/systemd/coredump.conf") {
+		content, err := s.platform_util.ReadFile("/etc/systemd/coredump.conf")
+		if err == nil && strings.Contains(content, "Storage=none") {
+			return positiveAuditFinding("PRIVACY-010-OK", "systemd-coredump storage disabled ✓", "Core dumps not stored", "Memory dump data not persisted"), nil
+		}
+	}
+	// Check if coredumps are disabled at kernel level
+	out, err := s.platform_util.RunCommand(ctx, "sysctl", "-n", "kernel.core_pattern")
+	if err == nil && strings.TrimSpace(out) == "|/dev/null" {
+		return positiveAuditFinding("PRIVACY-010-OK", "Core dumps discarded ✓", "kernel.core_pattern=/dev/null", "Memory dump data not persisted"), nil
+	}
+	return &models.Finding{
+		ID:          "PRIVACY-010",
+		Category:    "privacy",
+		Severity:    models.SeverityLow,
+		Title:       "Core dumps may be stored",
+		Description: "systemd-coredump or kernel core dumps may write process memory to disk. These files can contain sensitive data.",
+		Remediation: "Disable core dump storage: add 'Storage=none' to /etc/systemd/coredump.conf  or set kernel.core_pattern=|/dev/null in sysctl",
+		Evidence:    []string{fmt.Sprintf("kernel.core_pattern: %s", strings.TrimSpace(out))},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkApportLinux checks if Apport crash reporter is enabled and potentially sending data
+func (s *Scanner) checkApportLinux(ctx context.Context) (*models.Finding, error) {
+	if !s.platform_util.FileExists("/etc/default/apport") {
+		return nil, nil // Not installed, not applicable
+	}
+	content, err := s.platform_util.ReadFile("/etc/default/apport")
+	if err != nil {
+		return nil, nil
+	}
+	if strings.Contains(content, "enabled=0") {
+		return positiveAuditFinding("PRIVACY-011-OK", "Apport crash reporter disabled ✓", "enabled=0 in /etc/default/apport", "Crash data not collected"), nil
+	}
+	return &models.Finding{
+		ID:          "PRIVACY-011",
+		Category:    "privacy",
+		Severity:    models.SeverityLow,
+		Title:       "Apport crash reporter is enabled",
+		Description: "Apport collects crash data and can submit it to Ubuntu's error reporting service. May capture sensitive process memory.",
+		Remediation: "Disable Apport: sudo systemctl disable apport  or set 'enabled=0' in /etc/default/apport",
+		Evidence:    []string{"enabled=1 in /etc/default/apport"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkJournaldPersistence checks that journald logs are persisted across reboots
+func (s *Scanner) checkJournaldPersistence(ctx context.Context) (*models.Finding, error) {
+	if s.platform_util.FileExists("/var/log/journal") {
+		return positiveAuditFinding("AUDIT-011-OK", "Journald persistent logging enabled ✓", "/var/log/journal directory exists", "Logs survive reboots"), nil
+	}
+	// Check journald.conf Storage setting
+	if s.platform_util.FileExists("/etc/systemd/journald.conf") {
+		content, _ := s.platform_util.ReadFile("/etc/systemd/journald.conf")
+		if strings.Contains(content, "Storage=persistent") {
+			return positiveAuditFinding("AUDIT-011-OK", "Journald persistent logging enabled ✓", "Storage=persistent in journald.conf", "Logs survive reboots"), nil
+		}
+	}
+	return &models.Finding{
+		ID:          "AUDIT-011",
+		Category:    "audit",
+		Severity:    models.SeverityMedium,
+		Title:       "Journald logs not persisted across reboots",
+		Description: "systemd journal is running in volatile mode. Logs are lost on reboot, hindering incident investigation.",
+		Remediation: "Enable persistent logging: sudo mkdir -p /var/log/journal && sudo systemd-tmpfiles --create --prefix /var/log/journal && sudo systemctl restart systemd-journald",
+		Evidence:    []string{"/var/log/journal directory absent"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkLogTampering checks if critical log files have append-only protection
+func (s *Scanner) checkLogTampering(ctx context.Context) (*models.Finding, error) {
+	logFiles := []string{"/var/log/auth.log", "/var/log/syslog", "/var/log/secure", "/var/log/messages"}
+	protected := 0
+	checked := 0
+	for _, path := range logFiles {
+		if !s.platform_util.FileExists(path) {
+			continue
+		}
+		checked++
+		out, err := s.platform_util.RunCommand(ctx, "lsattr", path)
+		if err == nil && strings.Contains(out, "a") {
+			protected++
+		}
+	}
+	if checked == 0 {
+		return nil, nil
+	}
+	if protected == checked {
+		return positiveAuditFinding("AUDIT-012-OK", "Log files append-only protected ✓", "chattr +a set on log files", "Log tampering prevented"), nil
+	}
+	return &models.Finding{
+		ID:          "AUDIT-012",
+		Category:    "audit",
+		Severity:    models.SeverityLow,
+		Title:       "Log files not append-only protected",
+		Description: "System log files lack the append-only immutable flag. A compromised root account could erase evidence.",
+		Remediation: "Set append-only on log files: sudo chattr +a /var/log/auth.log /var/log/syslog  (note: this prevents log rotation — use selectively)",
+		Evidence:    []string{fmt.Sprintf("%d of %d log files lack append-only flag", checked-protected, checked)},
+		Timestamp:   time.Now(),
+	}, nil
+}
