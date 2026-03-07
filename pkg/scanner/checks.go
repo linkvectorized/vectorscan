@@ -1195,24 +1195,36 @@ func (s *Scanner) checkRootSSHLogin(ctx context.Context) (*models.Finding, error
 	return positiveAuditFinding("AUTH-001-OK", "Root SSH login disabled ✓", "SSH root access denied", "Direct root SSH login is disabled"), nil
 }
 
-// checkEmptyPasswordAccounts checks for accounts with no password hash on macOS
+// checkEmptyPasswordAccounts checks for accounts with no password hash
 func (s *Scanner) checkEmptyPasswordAccounts(ctx context.Context) (*models.Finding, error) {
-	// /etc/shadow is Linux-only. On macOS, password hashes live in the local directory service.
-	// dscl ShadowHashData requires root; without root we flag the root account directly.
-	// With root: scan all non-system users (UID >= 500) for missing ShadowHashData.
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c",
-		`dscl . -list /Users UniqueID 2>/dev/null | awk '$2+0 >= 500 {print $1}' | while read u; do`+
-			` shadow=$(dscl . -read "/Users/$u" ShadowHashData 2>/dev/null | grep -v "^ShadowHashData:$" | tr -d ' \n');`+
-			` [ -z "$shadow" ] && echo "$u"; done 2>/dev/null`)
+	var output string
+	var err error
+
+	if s.platform == "linux" {
+		// On Linux, /etc/shadow second field empty means no password
+		output, err = s.platform_util.RunCommand(ctx, "sh", "-c",
+			`awk -F: '($2 == "" || $2 == "!!" ) && $1 != "root" {print $1}' /etc/shadow 2>/dev/null`)
+	} else {
+		// macOS: password hashes live in the local directory service
+		output, err = s.platform_util.RunCommand(ctx, "sh", "-c",
+			`dscl . -list /Users UniqueID 2>/dev/null | awk '$2+0 >= 500 {print $1}' | while read u; do`+
+				` shadow=$(dscl . -read "/Users/$u" ShadowHashData 2>/dev/null | grep -v "^ShadowHashData:$" | tr -d ' \n');`+
+				` [ -z "$shadow" ] && echo "$u"; done 2>/dev/null`)
+	}
+
 	if err == nil && strings.TrimSpace(output) != "" {
 		users := strings.TrimSpace(output)
+		remediation := "Set a password for each account: sudo dscl . -passwd /Users/<username> <newpassword>"
+		if s.platform == "linux" {
+			remediation = "Set a password for each account: sudo passwd <username>"
+		}
 		return &models.Finding{
 			ID:          "AUTH-002",
 			Category:    "authentication",
 			Severity:    models.SeverityCritical,
 			Title:       "Users with no password hash detected",
 			Description: fmt.Sprintf("The following accounts have no password hash and may allow password-less login: %s", users),
-			Remediation: "Set a password for each account: sudo dscl . -passwd /Users/<username> <newpassword>",
+			Remediation: remediation,
 			Evidence:    []string{fmt.Sprintf("Accounts without password hash: %s", users)},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1223,7 +1235,29 @@ func (s *Scanner) checkEmptyPasswordAccounts(ctx context.Context) (*models.Findi
 
 // checkPasswordExpiration checks if password expiration policy is set
 func (s *Scanner) checkPasswordExpiration(ctx context.Context) (*models.Finding, error) {
-	// Check the current user's plist, not just root (which is usually locked anyway)
+	if s.platform == "linux" {
+		// Check /etc/login.defs for PASS_MAX_DAYS
+		output, err := s.platform_util.RunCommand(ctx, "sh", "-c",
+			`grep -E "^PASS_MAX_DAYS" /etc/login.defs 2>/dev/null | awk '{print $2}'`)
+		if err == nil {
+			days := strings.TrimSpace(output)
+			if days == "" || days == "99999" {
+				return &models.Finding{
+					ID:          "AUTH-003",
+					Category:    "authentication",
+					Severity:    models.SeverityMedium,
+					Title:       "Password expiration policy not configured",
+					Description: "Passwords do not expire. PASS_MAX_DAYS is unset or set to 99999 in /etc/login.defs.",
+					Remediation: "Set PASS_MAX_DAYS to 90 or less in /etc/login.defs and apply to existing users with: chage --maxdays 90 <username>",
+					Evidence:    []string{fmt.Sprintf("PASS_MAX_DAYS=%s", days)},
+					Timestamp:   time.Now(),
+				}, nil
+			}
+		}
+		return positiveAuditFinding("AUTH-003-OK", "Password expiration configured ✓", "Password rotation policy enabled", "Periodic password changes required"), nil
+	}
+
+	// macOS: check the current user's plist, not just root (which is usually locked anyway)
 	currentUser, err := s.platform_util.RunCommand(ctx, "sh", "-c", "id -un 2>/dev/null")
 	if err != nil || strings.TrimSpace(currentUser) == "" {
 		currentUser = "root"
@@ -1233,7 +1267,6 @@ func (s *Scanner) checkPasswordExpiration(ctx context.Context) (*models.Finding,
 	plistPath := fmt.Sprintf("/var/db/dslocal/nodes/Default/users/%s.plist", currentUser)
 	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("plutil -p %q 2>/dev/null | grep -i maxPasswordAge", plistPath))
 	if err != nil || strings.TrimSpace(output) == "" {
-		// Also check via configuration profiles (MDM)
 		profileOutput, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "profiles show -type configuration 2>/dev/null | grep -i 'maxPINAgeInDays\\|maxPasscodeAge\\|maxPasswordAge'")
 		if strings.TrimSpace(profileOutput) != "" {
 			return positiveAuditFinding("AUTH-003-OK", "Password expiration configured ✓", "MDM profile enforces password expiration", "Periodic password changes required"), nil
@@ -1255,6 +1288,26 @@ func (s *Scanner) checkPasswordExpiration(ctx context.Context) (*models.Finding,
 
 // checkAccountLockout checks if account lockout after failed login attempts is enabled
 func (s *Scanner) checkAccountLockout(ctx context.Context) (*models.Finding, error) {
+	if s.platform == "linux" {
+		// Check PAM for pam_tally2 or pam_faillock
+		output, _ := s.platform_util.RunCommand(ctx, "sh", "-c",
+			`grep -rE "pam_tally2|pam_faillock" /etc/pam.d/ 2>/dev/null | grep -v "^#"`)
+		if strings.TrimSpace(output) != "" {
+			return positiveAuditFinding("AUTH-004-OK", "Account lockout enabled ✓", "PAM lockout configured", "Brute force protection active"), nil
+		}
+		return &models.Finding{
+			ID:          "AUTH-004",
+			Category:    "authentication",
+			Severity:    models.SeverityMedium,
+			Title:       "Account lockout policy not configured",
+			Description: "No PAM account lockout after failed login attempts. Attackers can brute force passwords.",
+			Remediation: "Configure pam_faillock in /etc/pam.d/common-auth: add 'auth required pam_faillock.so deny=5 unlock_time=600'",
+			Evidence:    []string{"No pam_tally2 or pam_faillock found in /etc/pam.d/"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+
+	// macOS
 	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read /Library/Preferences/com.apple.loginwindow 2>/dev/null | grep -i 'MaxFailedAttempts\\|lockLockoutDuration'")
 	if err != nil || strings.TrimSpace(output) == "" {
 		return &models.Finding{
@@ -1960,3 +2013,184 @@ func (s *Scanner) checkThirdPartyDataSharing(ctx context.Context) (*models.Findi
 	return positiveAuditFinding("TELEMETRY-004-OK", "Third-party tracking blocked ✓", "Privacy browsing enabled", "Ad tracking prevention active"), nil
 }
 
+
+// ── Linux-specific checks ─────────────────────────────────────────────────────
+
+// checkFirewallLinux checks if a firewall is active (ufw or firewalld)
+func (s *Scanner) checkFirewallLinux(ctx context.Context) (*models.Finding, error) {
+	// Try firewalld
+	if out, err := s.platform_util.RunCommand(ctx, "systemctl", "is-active", "firewalld"); err == nil && strings.TrimSpace(out) == "active" {
+		return positiveAuditFinding("FW-001-OK", "Firewall active ✓", "firewalld running", "Network ingress filtered"), nil
+	}
+	// Try ufw
+	if out, err := s.platform_util.RunCommand(ctx, "ufw", "status"); err == nil && strings.Contains(out, "Status: active") {
+		return positiveAuditFinding("FW-001-OK", "Firewall active ✓", "ufw enabled", "Network ingress filtered"), nil
+	}
+	// Try iptables — consider active if non-default rules exist
+	if out, err := s.platform_util.RunCommand(ctx, "iptables", "-L", "-n"); err == nil && strings.Count(out, "\n") > 10 {
+		return positiveAuditFinding("FW-001-OK", "Firewall active ✓", "iptables rules present", "Network ingress filtered"), nil
+	}
+	return &models.Finding{
+		ID:          "FW-001",
+		Category:    "network",
+		Severity:    models.SeverityHigh,
+		Title:       "No firewall detected",
+		Description: "Neither ufw, firewalld, nor iptables rules are active. The host accepts all inbound connections.",
+		Remediation: "Enable ufw: sudo ufw enable && sudo ufw default deny incoming  —  or install firewalld: sudo systemctl enable --now firewalld",
+		Evidence:    []string{"ufw inactive", "firewalld inactive", "no iptables rules"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkAppArmorSELinux checks if mandatory access control is enforced
+func (s *Scanner) checkAppArmorSELinux(ctx context.Context) (*models.Finding, error) {
+	// Check AppArmor
+	if out, err := s.platform_util.RunCommand(ctx, "sh", "-c", "aa-status 2>/dev/null | grep 'profiles are in enforce mode'"); err == nil && strings.TrimSpace(out) != "" {
+		return positiveAuditFinding("MAC-001-OK", "AppArmor enforcing ✓", "Mandatory access control active", "Process confinement enforced"), nil
+	}
+	// Check SELinux
+	if out, err := s.platform_util.RunCommand(ctx, "getenforce"); err == nil && strings.TrimSpace(out) == "Enforcing" {
+		return positiveAuditFinding("MAC-001-OK", "SELinux enforcing ✓", "Mandatory access control active", "Process confinement enforced"), nil
+	}
+	return &models.Finding{
+		ID:          "MAC-001",
+		Category:    "system",
+		Severity:    models.SeverityHigh,
+		Title:       "Mandatory access control not enforcing",
+		Description: "Neither AppArmor nor SELinux is in enforcing mode. Processes run without mandatory confinement.",
+		Remediation: "Enable AppArmor: sudo systemctl enable --now apparmor  —  or set SELinux to enforcing in /etc/selinux/config: SELINUX=enforcing",
+		Evidence:    []string{"AppArmor not in enforce mode", "SELinux not enforcing"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkLUKSEncryption checks if the root filesystem is on an encrypted volume
+func (s *Scanner) checkLUKSEncryption(ctx context.Context) (*models.Finding, error) {
+	// lsblk -o TYPE lists "crypt" entries for LUKS-mapped devices
+	out, err := s.platform_util.RunCommand(ctx, "sh", "-c", "lsblk -o TYPE 2>/dev/null | grep crypt")
+	if err == nil && strings.TrimSpace(out) != "" {
+		return positiveAuditFinding("ENC-001-OK", "Disk encryption active ✓", "LUKS encrypted volume detected", "Data at rest is protected"), nil
+	}
+	// Also check dmsetup
+	if out, err := s.platform_util.RunCommand(ctx, "sh", "-c", "dmsetup table 2>/dev/null | grep crypt"); err == nil && strings.TrimSpace(out) != "" {
+		return positiveAuditFinding("ENC-001-OK", "Disk encryption active ✓", "dm-crypt device detected", "Data at rest is protected"), nil
+	}
+	return &models.Finding{
+		ID:          "ENC-001",
+		Category:    "encryption",
+		Severity:    models.SeverityHigh,
+		Title:       "No disk encryption detected",
+		Description: "No LUKS/dm-crypt encrypted volumes found. Data at rest is unprotected if the drive is removed.",
+		Remediation: "Encrypt new installs with LUKS during OS setup. For existing systems, consider encrypting the home directory: sudo ecryptfs-migrate-home -u <user>",
+		Evidence:    []string{"No crypt entries in lsblk or dmsetup"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkAutoUpdatesLinux checks if unattended security updates are configured
+func (s *Scanner) checkAutoUpdatesLinux(ctx context.Context) (*models.Finding, error) {
+	// Debian/Ubuntu: unattended-upgrades
+	if s.platform_util.FileExists("/etc/apt/apt.conf.d/20auto-upgrades") {
+		out, _ := s.platform_util.ReadFile("/etc/apt/apt.conf.d/20auto-upgrades")
+		if strings.Contains(out, `"1"`) {
+			return positiveAuditFinding("UPD-001-OK", "Automatic security updates enabled ✓", "unattended-upgrades configured", "Security patches applied automatically"), nil
+		}
+	}
+	// RHEL/CentOS/Fedora: dnf-automatic
+	if out, err := s.platform_util.RunCommand(ctx, "systemctl", "is-enabled", "dnf-automatic"); err == nil && strings.TrimSpace(out) == "enabled" {
+		return positiveAuditFinding("UPD-001-OK", "Automatic security updates enabled ✓", "dnf-automatic enabled", "Security patches applied automatically"), nil
+	}
+	return &models.Finding{
+		ID:          "UPD-001",
+		Category:    "system",
+		Severity:    models.SeverityMedium,
+		Title:       "Automatic security updates not configured",
+		Description: "Security patches are not applied automatically. Known vulnerabilities may remain unpatched.",
+		Remediation: "Debian/Ubuntu: sudo apt install unattended-upgrades && sudo dpkg-reconfigure unattended-upgrades  —  RHEL/Fedora: sudo dnf install dnf-automatic && sudo systemctl enable --now dnf-automatic",
+		Evidence:    []string{"unattended-upgrades not configured", "dnf-automatic not enabled"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkSSHServiceLinux checks if the SSH daemon is running and warns if unnecessary
+func (s *Scanner) checkSSHServiceLinux(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "systemctl", "is-active", "ssh")
+	if err != nil {
+		// Try sshd (RHEL naming)
+		out, err = s.platform_util.RunCommand(ctx, "systemctl", "is-active", "sshd")
+	}
+	if err == nil && strings.TrimSpace(out) == "active" {
+		return &models.Finding{
+			ID:          "SSH-003",
+			Category:    "network",
+			Severity:    models.SeverityHigh,
+			Title:       "SSH service is running",
+			Description: "SSH daemon is running and accepting connections. If not required, disable it to reduce attack surface.",
+			Remediation: "If SSH is not needed: sudo systemctl disable --now ssh  —  If required, ensure key-based auth only and root login is disabled.",
+			Evidence:    []string{"sshd is active"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("SSH-003-OK", "SSH service not running ✓", "SSH daemon not active", "Remote access attack surface minimised"), nil
+}
+
+// checkKernelHardeningLinux checks key sysctl kernel hardening parameters
+func (s *Scanner) checkKernelHardeningLinux(ctx context.Context) (*models.Finding, error) {
+	type param struct {
+		key      string
+		want     string
+		describe string
+	}
+	params := []param{
+		{"kernel.randomize_va_space", "2", "ASLR disabled"},
+		{"net.ipv4.conf.all.rp_filter", "1", "Reverse path filtering disabled"},
+		{"net.ipv4.conf.all.accept_redirects", "0", "ICMP redirects accepted"},
+		{"kernel.dmesg_restrict", "1", "dmesg readable by non-root"},
+		{"fs.suid_dumpable", "0", "SUID core dumps allowed"},
+	}
+
+	issues := []string{}
+	for _, p := range params {
+		out, err := s.platform_util.RunCommand(ctx, "sysctl", "-n", p.key)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(out) != p.want {
+			issues = append(issues, p.describe)
+		}
+	}
+
+	if len(issues) > 0 {
+		return &models.Finding{
+			ID:          "KERNEL-010",
+			Category:    "kernel",
+			Severity:    models.SeverityMedium,
+			Title:       "Kernel hardening parameters misconfigured",
+			Description: fmt.Sprintf("The following kernel parameters weaken security: %s", strings.Join(issues, "; ")),
+			Remediation: "Add hardening parameters to /etc/sysctl.d/99-hardening.conf and apply with: sudo sysctl --system",
+			Evidence:    issues,
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("KERNEL-010-OK", "Kernel hardening parameters set ✓", "sysctl security params configured", "Kernel attack surface reduced"), nil
+}
+
+// checkPasswordPolicyLinux checks PAM password complexity requirements
+func (s *Scanner) checkPasswordPolicyLinux(ctx context.Context) (*models.Finding, error) {
+	// Check for pam_pwquality or pam_cracklib in PAM config
+	out, _ := s.platform_util.RunCommand(ctx, "sh", "-c",
+		`grep -rE "pam_pwquality|pam_cracklib" /etc/pam.d/ 2>/dev/null | grep -v "^#"`)
+	if strings.TrimSpace(out) != "" {
+		return positiveAuditFinding("PWD-001-OK", "Password complexity policy configured ✓", "PAM password quality enforcement active", "Weak passwords rejected"), nil
+	}
+	return &models.Finding{
+		ID:          "PWD-001",
+		Category:    "authentication",
+		Severity:    models.SeverityMedium,
+		Title:       "No password complexity policy",
+		Description: "PAM is not enforcing password complexity. Users can set trivially weak passwords.",
+		Remediation: "Install and configure pam_pwquality: sudo apt install libpam-pwquality  —  then add to /etc/pam.d/common-password: 'password requisite pam_pwquality.so retry=3 minlen=12'",
+		Evidence:    []string{"No pam_pwquality or pam_cracklib in /etc/pam.d/"},
+		Timestamp:   time.Now(),
+	}, nil
+}

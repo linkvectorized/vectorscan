@@ -36,6 +36,12 @@ jobs:
           - goos: darwin
             goarch: amd64
             asset: vectorscan-darwin-amd64
+          - goos: linux
+            goarch: amd64
+            asset: vectorscan-linux-amd64
+          - goos: linux
+            goarch: arm64
+            asset: vectorscan-linux-arm64
 
     steps:
       - uses: actions/checkout@v4
