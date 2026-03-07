@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -22,58 +21,45 @@ var version = "dev"
 
 const repo = "linkvectorized/vectorscan"
 
-// goarch is baked in at compile time via runtime.GOARCH
-var goarch = runtime.GOARCH
-
 func main() {
-	// Define CLI flags
 	outputFormat := flag.String("output", "table", "Output format (table, json, csv, markdown)")
 	versionFlag := flag.Bool("version", false, "Show version")
 	helpFlag := flag.Bool("help", false, "Show help")
-	// serveFlag := flag.Bool("serve", false, "Start the web dashboard server") // TODO: uncomment when frontend ready
-	// portFlag := flag.Int("port", 8080, "Dashboard server port") // TODO: uncomment when frontend ready
 
 	flag.Parse()
 
-	// Handle version flag
 	if *versionFlag {
 		fmt.Printf("vectorscan v%s\n", version)
 		os.Exit(0)
 	}
 
-	// Handle help flag
 	if *helpFlag {
 		printHelp()
 		os.Exit(0)
 	}
 
-	// Validate output format
 	if *outputFormat != "table" && *outputFormat != "json" && *outputFormat != "csv" && *outputFormat != "markdown" {
 		fmt.Fprintf(os.Stderr, "Error: unsupported output format '%s'\n", *outputFormat)
 		fmt.Fprintf(os.Stderr, "Supported formats: table, json, csv, markdown\n")
 		os.Exit(1)
 	}
 
-	// Check if running as root (recommended for accurate results)
 	if os.Geteuid() != 0 {
 		fmt.Fprintf(os.Stderr, "Warning: not running as root. Some checks may be incomplete or inaccurate.\n\n")
 	}
 
-	// Check for updates in background while scan runs
+	// Check for newer version in background while scan runs
 	updateCh := make(chan string, 1)
 	go func() {
-		updateCh <- checkForUpdate()
+		updateCh <- checkLatestVersion()
 	}()
 
-	// Create scanner
 	s, err := scanner.New()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error creating scanner: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Run scan with progress tracking and timeout
-	// Use timeout of 5 minutes for entire scan to prevent hanging on slow checks
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -81,7 +67,6 @@ func main() {
 	var scanErr error
 	var wg sync.WaitGroup
 
-	// Start progress goroutine
 	stopProgress := make(chan bool, 1)
 	wg.Add(1)
 	go func() {
@@ -89,14 +74,11 @@ func main() {
 		showProgress(s, stopProgress)
 	}()
 
-	// Run the actual scan
 	report, scanErr = s.Scan(ctx)
 
-	// Stop progress display
 	stopProgress <- true
 	wg.Wait()
 
-	// Clear the progress line
 	fmt.Fprint(os.Stderr, "\r")
 
 	if scanErr != nil {
@@ -104,21 +86,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Dashboard server disabled for now - will implement frontend tomorrow
-	// if *serveFlag {
-	// 	if err := web.Serve(report, *portFlag); err != nil {
-	// 		fmt.Fprintf(os.Stderr, "Dashboard error: %v\n", err)
-	// 		os.Exit(1)
-	// 	}
-	// 	return
-	// }
-
-	// Apply update if one was found
-	if msg := <-updateCh; msg != "" {
-		fmt.Fprintln(os.Stderr, msg)
+	// Print update notice if a newer version exists
+	if notice := <-updateCh; notice != "" {
+		fmt.Fprintln(os.Stderr, notice)
 	}
 
-	// Output results based on format
 	switch *outputFormat {
 	case "table":
 		output.PrintTable(report)
@@ -131,9 +103,8 @@ func main() {
 	}
 }
 
-// checkForUpdate fetches the latest release tag from GitHub and self-updates if behind.
-// Returns a status message or empty string if already current.
-func checkForUpdate() string {
+// checkLatestVersion checks GitHub for a newer release and returns a notice string if one exists.
+func checkLatestVersion() string {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get("https://api.github.com/repos/" + repo + "/releases/latest")
 	if err != nil {
@@ -155,39 +126,7 @@ func checkForUpdate() string {
 		return ""
 	}
 
-	exe, err := os.Executable()
-	if err != nil {
-		return ""
-	}
-
-	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/vectorscan-darwin-%s", repo, release.TagName, goarch)
-
-	resp2, err := client.Get(url)
-	if err != nil || resp2.StatusCode != 200 {
-		return ""
-	}
-	defer resp2.Body.Close()
-
-	tmp, err := os.CreateTemp("", "vectorscan-update-*")
-	if err != nil {
-		return ""
-	}
-	defer os.Remove(tmp.Name())
-
-	if _, err := tmp.ReadFrom(resp2.Body); err != nil {
-		tmp.Close()
-		return ""
-	}
-	tmp.Close()
-
-	if err := os.Chmod(tmp.Name(), 0755); err != nil {
-		return ""
-	}
-	if err := os.Rename(tmp.Name(), exe); err != nil {
-		return ""
-	}
-
-	return fmt.Sprintf("Updated vectorscan v%s → v%s", current, latest)
+	return fmt.Sprintf("Update available: v%s → v%s  |  curl -fsSL https://raw.githubusercontent.com/%s/master/install.sh | bash", current, latest, repo)
 }
 
 func printHelp() {
@@ -208,7 +147,7 @@ Examples:
   vectorscan -output markdown
 
 Notes:
-  - macOS only (Linux/Windows support coming soon)
+  - macOS and Linux supported
   - Run with sudo for most accurate results
   - Some checks may require elevated privileges
 `, version)
@@ -230,7 +169,6 @@ func showProgress(s *scanner.Scanner, stop chan bool) {
 			current = progress.CurrentCheck
 			total = progress.TotalChecks
 			lastCheck = progress.CheckName
-			// Display progress once per check update, no animation
 			displayProgressBar(current, total, lastCheck, "")
 		}
 	}
@@ -260,11 +198,9 @@ func displayProgressBar(current, total int, checkName, spinner string) {
 	}
 	bar += "]"
 
-	// Pad check name to consistent width and truncate
 	checkNamePadded := truncate(checkName, 50)
 	checkNamePadded = fmt.Sprintf("%-50s", checkNamePadded)
 
-	// Only show spinner if provided
 	spinnerPrefix := ""
 	if spinner != "" {
 		spinnerPrefix = spinner + " "
