@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -35,13 +36,19 @@ type ReportResponse struct {
 	TotalFindings int              `json:"total_findings"`
 	PassingChecks int              `json:"passing_checks"`
 	SecurityScore int              `json:"security_score"`
-	ScanTimeMs    int64            `json:"scan_time_ms"` // Computed from ScanTime duration
+	ScanTimeMs    int64            `json:"scan_time_ms"`
 	SecurityLevel string           `json:"security_level"`
 }
 
-// Serve starts the HTTP server with the given report
+const (
+	pingInterval  = 15 * time.Second // browser pings this often
+	idleTimeout   = 45 * time.Second // server shuts down after this long with no ping
+)
+
+// Serve starts the HTTP server with the given report.
+// The server detaches from the terminal so it can be closed safely.
+// It shuts down automatically when the browser tab is closed.
 func Serve(report *models.Report, port int) error {
-	// Create the response envelope
 	response := ReportResponse{
 		Findings:      report.Findings,
 		ScanDate:      report.ScanDate,
@@ -61,10 +68,13 @@ func Serve(report *models.Report, port int) error {
 		SecurityLevel: report.SecurityLevel(),
 	}
 
-	// Set up routes
+	// lastPing tracks when the browser last checked in.
+	// Initialised to now so the grace period starts from server start.
+	var lastPing atomic.Int64
+	lastPing.Store(time.Now().UnixNano())
+
 	mux := http.NewServeMux()
 
-	// Serve index.html at /
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -75,52 +85,81 @@ func Serve(report *models.Report, port int) error {
 		w.Write(data)
 	})
 
-	// Serve API endpoint
 	mux.HandleFunc("/api/report", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
 	})
 
-	// Create server
+	// /ping is called by the browser every 15s to signal the tab is still open.
+	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
+		lastPing.Store(time.Now().UnixNano())
+		w.WriteHeader(http.StatusNoContent)
+	})
+
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	srv := &http.Server{
 		Addr:    addr,
 		Handler: mux,
 	}
 
-	// Signal handling for graceful shutdown
+	shutdown := make(chan struct{}, 1)
+
+	// Graceful shutdown helper
+	stop := func() {
+		select {
+		case shutdown <- struct{}{}:
+		default:
+		}
+	}
+
+	// Signal handler (Ctrl+C / kill)
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Start server in goroutine
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+		<-sigChan
+		stop()
+	}()
+
+	// Idle watchdog: shut down when browser tab has been closed for idleTimeout
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			age := time.Duration(time.Now().UnixNano() - lastPing.Load())
+			if age > idleTimeout {
+				fmt.Fprintf(os.Stderr, "\nBrowser disconnected — shutting down.\n")
+				stop()
+				return
+			}
 		}
 	}()
 
-	// Give server time to start
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "Server error: %v\n", err)
+			stop()
+		}
+	}()
+
 	time.Sleep(300 * time.Millisecond)
 
-	// Print message and open browser
+	// Detach from the controlling terminal so closing it doesn't kill the server.
+	// This creates a new session — the process is now independent of the shell.
+	syscall.Setsid() //nolint:errcheck
+
 	url := fmt.Sprintf("http://localhost:%d", port)
-	fmt.Fprintf(os.Stderr, "\n✓ Scan complete! Opening dashboard at %s\n", url)
-	time.Sleep(500 * time.Millisecond) // Brief pause before opening
+	fmt.Fprintf(os.Stderr, "\n✓ Scan complete! Dashboard at %s\n", url)
+	fmt.Fprintf(os.Stderr, "  PID %d — safe to close this terminal.\n", os.Getpid())
+	fmt.Fprintf(os.Stderr, "  Server stops automatically when you close the browser tab.\n\n")
+
 	openBrowser(url)
 
-	// Wait for interrupt signal
-	<-sigChan
-	fmt.Fprintf(os.Stderr, "\nShutting down server...\n")
+	<-shutdown
 
-	// Graceful shutdown with timeout
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Shutdown error: %v\n", err)
-		return err
-	}
+	srv.Shutdown(ctx) //nolint:errcheck
 
-	fmt.Fprintf(os.Stderr, "Server stopped.\n")
 	return nil
 }
 
@@ -137,5 +176,5 @@ func openBrowser(url string) {
 	default:
 		return
 	}
-	_ = cmd.Run() // Ignore errors, user can manually open browser
+	_ = cmd.Start() // Start async — don't block waiting for browser to close
 }

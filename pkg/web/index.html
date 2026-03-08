@@ -271,6 +271,8 @@
         tr.medium { border-left-color: var(--medium); }
         tr.low { border-left-color: var(--low); }
         tr.info { border-left-color: var(--info); }
+        tr.passed { border-left-color: var(--low); opacity: 0.6; }
+        tr.skipped { border-left-color: var(--text-secondary); opacity: 0.5; }
 
         .severity-badge {
             display: inline-block;
@@ -415,7 +417,7 @@
 </head>
 <body>
     <header>
-        <div class="header-title">VectorScan v1.0.0</div>
+        <div class="header-title">VectorScan</div>
         <div class="header-meta">
             <div class="meta-item"><strong>Host:</strong> <span id="metaHostname">-</span></div>
             <div class="meta-item"><strong>Platform:</strong> <span id="metaPlatform">-</span></div>
@@ -490,6 +492,12 @@
                 <select class="filter-select" id="categoryFilter">
                     <option value="">All Categories</option>
                 </select>
+                        <select class="filter-select" id="statusFilter">
+                    <option value="issues">Issues Only</option>
+                    <option value="">All</option>
+                    <option value="passed">Passing</option>
+                    <option value="skipped">Skipped</option>
+                </select>
                 <div class="table-info">Showing <span id="tableShowing">0</span> of <span id="tableTotal">0</span> findings</div>
             </div>
             <div class="table-wrapper">
@@ -511,12 +519,13 @@
     </div>
 
     <script>
-        let window.__reportData = null;
-        let window.__filteredFindings = [];
-        let window.__sortColumn = 'timestamp';
-        let window.__sortAsc = false;
+        let reportData = null;
+        let filteredFindings = [];
+        let sortColumn = 'severity';
+        let sortAsc = true;
 
-        // Initialize on page load
+        const SEVERITY_ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, INFO: 4 };
+
         async function init() {
             try {
                 await loadReport();
@@ -526,7 +535,7 @@
                 populateCategoryFilter();
                 initSeverityChart();
                 initCategoryChart();
-                renderTable();
+                applyFilters();
                 attachEventListeners();
             } catch (err) {
                 console.error('Dashboard error:', err);
@@ -537,47 +546,32 @@
         async function loadReport() {
             const response = await fetch('/api/report');
             if (!response.ok) throw new Error('Failed to load report: ' + response.status);
-            window.__reportData = await response.json();
-            window.__filteredFindings = [...window.__reportData.findings];
+            reportData = await response.json();
         }
 
         function populateMetadata() {
-            const data = window.__reportData;
-            const scanDate = new Date(data.scan_date);
-            document.getElementById('metaHostname').textContent = data.hostname || '-';
-            document.getElementById('metaPlatform').textContent = data.platform || '-';
-            document.getElementById('metaOS').textContent = data.os_version || '-';
+            const scanDate = new Date(reportData.scan_date);
+            document.getElementById('metaHostname').textContent = reportData.hostname || '-';
+            document.getElementById('metaPlatform').textContent = reportData.platform || '-';
+            document.getElementById('metaOS').textContent = reportData.os_version || '-';
             document.getElementById('metaDate').textContent = scanDate.toLocaleString();
-            document.getElementById('metaDuration').textContent = calculateDuration();
-        }
-
-        function calculateDuration() {
-            const data = window.__reportData;
-            if (!data.scan_date) return '-';
-            // For display, estimate duration from findings timestamp if available
-            if (data.findings.length > 0) {
-                const first = new Date(data.findings[0].timestamp);
-                const last = new Date(data.findings[data.findings.length - 1].timestamp);
-                const ms = Math.abs(last - first) || 1000;
-                return formatDuration(ms);
-            }
-            return '-';
+            document.getElementById('metaDuration').textContent = formatDuration(reportData.scan_time_ms || 0);
         }
 
         function formatDuration(ms) {
+            if (!ms || ms <= 0) return '-';
             if (ms < 1000) return Math.round(ms) + 'ms';
             if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
             return (ms / 60000).toFixed(1) + 'm';
         }
 
         function updateKPIs() {
-            const data = window.__reportData;
-            animateCount('kpiCritical', data.critical);
-            animateCount('kpiHigh', data.high);
-            animateCount('kpiMedium', data.medium);
-            animateCount('kpiLow', data.low);
-            animateCount('kpiInfo', data.info);
-            animateCount('kpiEnabled', data.enabled);
+            animateCount('kpiCritical', reportData.critical);
+            animateCount('kpiHigh', reportData.high);
+            animateCount('kpiMedium', reportData.medium);
+            animateCount('kpiLow', reportData.low);
+            animateCount('kpiInfo', reportData.info);
+            animateCount('kpiEnabled', reportData.enabled);
         }
 
         function animateCount(elementId, target) {
@@ -596,54 +590,69 @@
         }
 
         function drawGauge() {
-            const score = window.__reportData.security_score;
+            const score = reportData.security_score;
+            // Extract just the first word e.g. "Good (75%+ ...)" -> "GOOD"
+            const levelWord = (reportData.security_level || '').split(/[\s(]/)[0].toUpperCase() || 'N/A';
+
             const canvas = document.getElementById('scoreGauge');
             const ctx = canvas.getContext('2d');
+            const dpr = window.devicePixelRatio || 1;
             const size = Math.min(180, canvas.offsetWidth - 20);
-            canvas.width = size;
-            canvas.height = size;
+            canvas.width = size * dpr;
+            canvas.height = size * dpr;
+            canvas.style.width = size + 'px';
+            canvas.style.height = size + 'px';
+            ctx.scale(dpr, dpr);
 
             const centerX = size / 2;
             const centerY = size / 2;
-            const radius = size / 2 - 10;
+            const radius = size / 2 - 12;
 
-            // Draw background arc
+            // Background ring
             ctx.strokeStyle = '#30363d';
-            ctx.lineWidth = 10;
+            ctx.lineWidth = 12;
             ctx.beginPath();
             ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
             ctx.stroke();
 
-            // Draw score arc with gradient
+            // Score arc
             const startAngle = -Math.PI / 2;
             const endAngle = startAngle + (score / 100) * Math.PI * 2;
-
             const gradient = ctx.createLinearGradient(centerX - radius, centerY, centerX + radius, centerY);
             gradient.addColorStop(0, '#f85149');
             gradient.addColorStop(0.33, '#d29922');
             gradient.addColorStop(0.66, '#e3b341');
             gradient.addColorStop(1, '#3fb950');
-
             ctx.strokeStyle = gradient;
+            ctx.lineWidth = 12;
+            ctx.lineCap = 'round';
             ctx.beginPath();
             ctx.arc(centerX, centerY, radius, startAngle, endAngle);
             ctx.stroke();
 
-            // Draw center text
+            // Score number
             ctx.fillStyle = '#c9d1d9';
-            ctx.font = 'bold 32px -apple-system, BlinkMacSystemFont, "Segoe UI"';
+            ctx.font = 'bold 36px -apple-system, BlinkMacSystemFont, "Segoe UI"';
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
-            ctx.fillText(score, centerX, centerY - 10);
+            ctx.fillText(score, centerX, centerY - 12);
 
-            ctx.font = '12px -apple-system, BlinkMacSystemFont, "Segoe UI"';
+            // "Status:" label
+            ctx.font = '11px -apple-system, BlinkMacSystemFont, "Segoe UI"';
             ctx.fillStyle = '#8b949e';
-            ctx.fillText('Security Score', centerX, centerY + 20);
+            ctx.fillText('Status:', centerX, centerY + 10);
+
+            // Level word — coloured by severity
+            const levelColours = { EXCELLENT: '#3fb950', GOOD: '#3fb950', FAIR: '#e3b341', POOR: '#d29922', CRITICAL: '#f85149' };
+            ctx.font = 'bold 13px -apple-system, BlinkMacSystemFont, "Segoe UI"';
+            ctx.fillStyle = levelColours[levelWord] || '#8b949e';
+            ctx.fillText(levelWord, centerX, centerY + 26);
         }
 
         function populateCategoryFilter() {
-            const categories = [...new Set(window.__reportData.findings.map(f => f.category))];
-            categories.sort();
+            // Only include categories that have issues (non-passed, non-skipped)
+            const issues = reportData.findings.filter(f => !f.passed && !f.skipped);
+            const categories = [...new Set(issues.map(f => f.category))].sort();
             const select = document.getElementById('categoryFilter');
             categories.forEach(cat => {
                 const option = document.createElement('option');
@@ -654,19 +663,14 @@
         }
 
         function initSeverityChart() {
-            if (typeof Chart === 'undefined') {
-                console.warn('Chart.js not loaded');
-                return;
-            }
-
-            const data = window.__reportData;
+            if (typeof Chart === 'undefined') return;
             const ctx = document.getElementById('severityChart').getContext('2d');
             new Chart(ctx, {
                 type: 'doughnut',
                 data: {
                     labels: ['Critical', 'High', 'Medium', 'Low', 'Info'],
                     datasets: [{
-                        data: [data.critical, data.high, data.medium, data.low, data.info],
+                        data: [reportData.critical, reportData.high, reportData.medium, reportData.low, reportData.info],
                         backgroundColor: ['#f85149', '#d29922', '#e3b341', '#3fb950', '#58a6ff'],
                         borderColor: '#161b22',
                         borderWidth: 2
@@ -676,38 +680,30 @@
                     responsive: true,
                     maintainAspectRatio: true,
                     plugins: {
-                        legend: {
-                            position: 'right',
-                            labels: { color: '#c9d1d9', font: { size: 12 }, padding: 12 }
-                        }
+                        legend: { position: 'right', labels: { color: '#c9d1d9', font: { size: 12 }, padding: 12 } }
                     }
                 }
             });
         }
 
         function initCategoryChart() {
-            if (typeof Chart === 'undefined') {
-                console.warn('Chart.js not loaded');
-                return;
-            }
+            if (typeof Chart === 'undefined') return;
 
+            // Chart shows only active issues, not passed/skipped
             const categories = {};
-            window.__reportData.findings.forEach(f => {
+            reportData.findings.filter(f => !f.passed && !f.skipped).forEach(f => {
                 categories[f.category] = (categories[f.category] || 0) + 1;
             });
 
             const sortedCats = Object.entries(categories).sort((a, b) => b[1] - a[1]);
-            const labels = sortedCats.map(([cat]) => cat.charAt(0).toUpperCase() + cat.slice(1));
-            const counts = sortedCats.map(([, count]) => count);
-
             const ctx = document.getElementById('categoryChart').getContext('2d');
             new Chart(ctx, {
                 type: 'bar',
                 data: {
-                    labels: labels,
+                    labels: sortedCats.map(([cat]) => cat.charAt(0).toUpperCase() + cat.slice(1)),
                     datasets: [{
-                        label: 'Findings',
-                        data: counts,
+                        label: 'Issues',
+                        data: sortedCats.map(([, n]) => n),
                         backgroundColor: '#58a6ff',
                         borderColor: '#238636',
                         borderWidth: 1
@@ -717,104 +713,102 @@
                     indexAxis: 'y',
                     responsive: true,
                     maintainAspectRatio: true,
-                    plugins: {
-                        legend: { display: false }
-                    },
+                    plugins: { legend: { display: false } },
                     scales: {
-                        x: {
-                            ticks: { color: '#8b949e' },
-                            grid: { color: '#30363d' }
-                        },
-                        y: {
-                            ticks: { color: '#8b949e' }
-                        }
+                        x: { ticks: { color: '#8b949e' }, grid: { color: '#30363d' } },
+                        y: { ticks: { color: '#8b949e' } }
                     }
                 }
             });
+        }
+
+        function rowClass(f) {
+            if (f.skipped) return 'skipped';
+            if (f.passed) return 'passed';
+            return f.severity.toLowerCase();
         }
 
         function renderTable() {
             const tbody = document.getElementById('findingsTable');
             tbody.innerHTML = '';
 
-            window.__filteredFindings.forEach((f, idx) => {
-                // Main row
+            filteredFindings.forEach((f, idx) => {
+                const cls = rowClass(f);
+                const severityCell = f.skipped
+                    ? '<span style="color:var(--text-secondary);font-size:11px">SKIPPED</span>'
+                    : f.passed
+                        ? '<span style="color:var(--low);font-size:11px">✓ PASS</span>'
+                        : `<span class="severity-badge severity-${f.severity.toLowerCase()}">${f.severity}</span>`;
+
                 const tr = document.createElement('tr');
-                tr.className = f.severity.toLowerCase();
+                tr.className = cls;
                 tr.innerHTML = `
-                    <td><span class="expand-toggle" onclick="toggleRow(${idx})">▶</span> ${f.id}</td>
-                    <td><span class="severity-badge severity-${f.severity.toLowerCase()}">${f.severity}</span></td>
-                    <td>${f.category}</td>
-                    <td>${f.title}</td>
-                    <td>${new Date(f.timestamp).toLocaleString()}</td>
+                    <td><span class="expand-toggle">▶</span> ${escapeHtml(f.id)}</td>
+                    <td>${severityCell}</td>
+                    <td>${escapeHtml(f.category)}</td>
+                    <td>${escapeHtml(f.title)}</td>
+                    <td>${new Date(f.timestamp).toLocaleTimeString()}</td>
                 `;
-                tr.onclick = (e) => { if (e.target.closest('button') === null) toggleRow(idx); };
+                tr.onclick = () => toggleRow(idx);
                 tbody.appendChild(tr);
 
-                // Detail row
                 const detailTr = document.createElement('tr');
-                detailTr.className = `detail-row ${f.severity.toLowerCase()}`;
+                detailTr.className = `detail-row ${cls}`;
                 detailTr.id = `detail-${idx}`;
                 detailTr.innerHTML = `
                     <td colspan="5" class="detail-cell">
                         <div class="detail-content">
                             <div class="detail-field">
                                 <div class="detail-label">Description</div>
-                                <div class="detail-value">${f.description}</div>
+                                <div class="detail-value">${escapeHtml(f.description)}</div>
                             </div>
                             <div class="detail-field">
                                 <div class="detail-label">Remediation</div>
-                                <div class="detail-value">${f.remediation}</div>
+                                <div class="detail-value">${escapeHtml(f.remediation)}</div>
                             </div>
                         </div>
                         <div class="detail-field" style="margin-top: 16px;">
                             <div class="detail-label">Evidence</div>
-                            ${f.evidence.map(e => `<div class="evidence-code">${escapeHtml(e)}</div>`).join('')}
+                            ${(f.evidence || []).map(e => `<div class="evidence-code">${escapeHtml(e)}</div>`).join('')}
                         </div>
                     </td>
                 `;
                 tbody.appendChild(detailTr);
             });
 
-            document.getElementById('tableShowing').textContent = window.__filteredFindings.length;
-            document.getElementById('tableTotal').textContent = window.__reportData.findings.length;
+            document.getElementById('tableShowing').textContent = filteredFindings.length;
+            document.getElementById('tableTotal').textContent = reportData.findings.length;
         }
 
         function toggleRow(idx) {
             const detail = document.getElementById(`detail-${idx}`);
-            if (detail) {
-                detail.classList.toggle('expanded');
-            }
+            if (detail) detail.classList.toggle('expanded');
         }
 
         function escapeHtml(text) {
+            if (!text) return '';
             const map = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' };
-            return text.replace(/[&<>"']/g, m => map[m]);
+            return String(text).replace(/[&<>"']/g, m => map[m]);
         }
 
         function toggleSort(column) {
-            const indicators = document.querySelectorAll('.sort-indicator');
-            indicators.forEach(el => el.textContent = '');
-
-            if (window.__sortColumn === column) {
-                window.__sortAsc = !window.__sortAsc;
+            document.querySelectorAll('.sort-indicator').forEach(el => el.textContent = '');
+            if (sortColumn === column) {
+                sortAsc = !sortAsc;
             } else {
-                window.__sortColumn = column;
-                window.__sortAsc = true;
+                sortColumn = column;
+                sortAsc = true;
             }
 
-            window.__filteredFindings.sort((a, b) => {
-                let aVal = a[column];
-                let bVal = b[column];
-                if (column === 'timestamp') {
-                    aVal = new Date(aVal);
-                    bVal = new Date(bVal);
-                }
+            filteredFindings.sort((a, b) => {
+                let aVal = column === 'severity' ? (SEVERITY_ORDER[a.severity] ?? 99) : a[column];
+                let bVal = column === 'severity' ? (SEVERITY_ORDER[b.severity] ?? 99) : b[column];
+                if (column === 'timestamp') { aVal = new Date(aVal); bVal = new Date(bVal); }
                 const cmp = aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
-                return window.__sortAsc ? cmp : -cmp;
+                return sortAsc ? cmp : -cmp;
             });
 
-            document.getElementById(`sort-${column}`).textContent = window.__sortAsc ? '▲' : '▼';
+            document.getElementById(`sort-${column}`).textContent = sortAsc ? '▲' : '▼';
             renderTable();
         }
 
@@ -822,14 +816,25 @@
             const search = document.getElementById('searchInput').value.toLowerCase();
             const severity = document.getElementById('severityFilter').value;
             const category = document.getElementById('categoryFilter').value;
+            const status = document.getElementById('statusFilter').value;
 
-            window.__filteredFindings = window.__reportData.findings.filter(f => {
-                const matchSearch = !search || f.title.toLowerCase().includes(search) ||
-                                   f.description.toLowerCase().includes(search) ||
-                                   f.id.toLowerCase().includes(search);
-                const matchSeverity = !severity || f.severity === severity;
-                const matchCategory = !category || f.category === category;
-                return matchSearch && matchSeverity && matchCategory;
+            filteredFindings = reportData.findings.filter(f => {
+                if (status === 'issues' && (f.passed || f.skipped)) return false;
+                if (status === 'passed' && !f.passed) return false;
+                if (status === 'skipped' && !f.skipped) return false;
+                if (severity && f.severity !== severity) return false;
+                if (category && f.category !== category) return false;
+                if (search && !f.title.toLowerCase().includes(search) &&
+                              !f.description.toLowerCase().includes(search) &&
+                              !f.id.toLowerCase().includes(search)) return false;
+                return true;
+            });
+
+            // Default sort: severity ascending
+            filteredFindings.sort((a, b) => {
+                const sa = SEVERITY_ORDER[a.severity] ?? 99;
+                const sb = SEVERITY_ORDER[b.severity] ?? 99;
+                return sortAsc ? sa - sb : sb - sa;
             });
 
             renderTable();
@@ -839,34 +844,24 @@
             document.getElementById('searchInput').addEventListener('input', applyFilters);
             document.getElementById('severityFilter').addEventListener('change', applyFilters);
             document.getElementById('categoryFilter').addEventListener('change', applyFilters);
+            document.getElementById('statusFilter').addEventListener('change', applyFilters);
         }
 
         function exportCSV() {
             const headers = ['ID', 'Category', 'Severity', 'Title', 'Description', 'Remediation', 'Evidence', 'Timestamp'];
-            const rows = window.__reportData.findings.map(f => [
-                f.id,
-                f.category,
-                f.severity,
-                f.title,
-                f.description,
-                f.remediation,
-                f.evidence.join('; '),
-                f.timestamp
+            const rows = reportData.findings.map(f => [
+                f.id, f.category, f.severity, f.title, f.description, f.remediation,
+                (f.evidence || []).join('; '), f.timestamp
             ]);
-
             let csv = headers.join(',') + '\n';
             rows.forEach(row => {
                 csv += row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',') + '\n';
             });
-
-            const blob = new Blob([csv], { type: 'text/csv' });
-            downloadBlob(blob, 'vectorscan-report.csv');
+            downloadBlob(new Blob([csv], { type: 'text/csv' }), 'vectorscan-report.csv');
         }
 
         function exportJSON() {
-            const json = JSON.stringify(window.__reportData, null, 2);
-            const blob = new Blob([json], { type: 'application/json' });
-            downloadBlob(blob, 'vectorscan-report.json');
+            downloadBlob(new Blob([JSON.stringify(reportData, null, 2)], { type: 'application/json' }), 'vectorscan-report.json');
         }
 
         function downloadBlob(blob, filename) {
@@ -880,11 +875,13 @@
             URL.revokeObjectURL(url);
         }
 
-        function exportPDF() {
-            window.print();
-        }
+        function exportPDF() { window.print(); }
 
-        // Start the app
+        // Keep server alive while tab is open; server auto-shuts down after tab closes.
+        function ping() { fetch('/ping', { method: 'POST' }).catch(() => {}); }
+        ping();
+        setInterval(ping, 15000);
+
         init();
     </script>
 </body>

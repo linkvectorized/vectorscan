@@ -14,7 +14,7 @@ import (
 	"github.com/linkvectorized/vectorscan/pkg/models"
 	"github.com/linkvectorized/vectorscan/pkg/output"
 	"github.com/linkvectorized/vectorscan/pkg/scanner"
-	// "github.com/linkvectorized/vectorscan/pkg/web" // TODO: uncomment when frontend ready
+	"github.com/linkvectorized/vectorscan/pkg/web"
 )
 
 var version = "dev"
@@ -22,7 +22,8 @@ var version = "dev"
 const repo = "linkvectorized/vectorscan"
 
 func main() {
-	outputFormat := flag.String("output", "table", "Output format (table, json, csv, markdown)")
+	outputFormat := flag.String("output", "table", "Output format (table, json, csv, markdown, web)")
+	portFlag := flag.Int("port", 8080, "Port for web dashboard (used with -output web)")
 	versionFlag := flag.Bool("version", false, "Show version")
 	helpFlag := flag.Bool("help", false, "Show help")
 
@@ -38,9 +39,9 @@ func main() {
 		os.Exit(0)
 	}
 
-	if *outputFormat != "table" && *outputFormat != "json" && *outputFormat != "csv" && *outputFormat != "markdown" {
+	if *outputFormat != "table" && *outputFormat != "json" && *outputFormat != "csv" && *outputFormat != "markdown" && *outputFormat != "web" {
 		fmt.Fprintf(os.Stderr, "Error: unsupported output format '%s'\n", *outputFormat)
-		fmt.Fprintf(os.Stderr, "Supported formats: table, json, csv, markdown\n")
+		fmt.Fprintf(os.Stderr, "Supported formats: table, json, csv, markdown, web\n")
 		os.Exit(1)
 	}
 
@@ -100,6 +101,11 @@ func main() {
 		output.PrintCSV(report)
 	case "markdown":
 		output.PrintMarkdown(report)
+	case "web":
+		if err := web.Serve(report, *portFlag); err != nil {
+			fmt.Fprintf(os.Stderr, "Web server error: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -136,7 +142,8 @@ Usage:
   vectorscan [options]
 
 Options:
-  -output string     Output format: table, json, csv, markdown (default: table)
+  -output string     Output format: table, json, csv, markdown, web (default: table)
+  -port int          Port for web dashboard (default: 8080)
   -version           Show version
   -help              Show this help message
 
@@ -145,6 +152,8 @@ Examples:
   sudo vectorscan
   vectorscan -output json
   vectorscan -output markdown
+  vectorscan -output web
+  vectorscan -output web -port 9090
 
 Notes:
   - macOS and Linux supported
