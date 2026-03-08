@@ -11,63 +11,11 @@
 
 > Big brother is always watching. Question everything. Especially the government.
 
+![VectorScan Dashboard](assets/dashboard.png)
+
 Fast, opinionated system security audit tool. Scans your Mac for misconfigurations, weak defaults, and attack vectors — then tells you exactly what to fix. No agents, no cloud, no telemetry. Just a binary and the truth.
 
 macOS and Linux supported. Windows coming soon.
-
-```
-$ sudo vectorscan
-
-[========================================] 100% (62/62) Third-party data sharing
-
-  ╔══════════════════════════════════════════════════════════╗
-  ║            VECTORSCAN — System Security Audit            ║
-  ╚══════════════════════════════════════════════════════════╝
-  Big brother is always watching. Question everything. Especially the government.
-
-Host:            macbook.local
-Platform:        darwin
-OS Version:      15.3.1
-Scan Date:       2026-03-06 19:42:07
-Scan Duration:   6842ms
-
-┌─ Security Score ─────────────────────────────────────────┐
-│ ████████░░ [83%] Good (75%+ checks passing)              │
-│ 38 of 62 checks passing | 196/248 points                 │
-└──────────────────────────────────────────────────────────┘
-
-Findings Summary:
-  🔴 Critical:  1
-  🟠 High:      3
-  🟡 Medium:    7
-  🟢 Low:       9
-  ✅ Enabled:   38
-  📊 Total:     62
-
-┌─ Detailed Findings ───────────────────────────────────────┐
-
-🔴 [PHYS-004] Automatic login enabled
-   Category:    physical
-   Severity:    CRITICAL
-   Description: Automatic login bypasses the login screen. Anyone with
-                physical access can use the computer.
-   Remediation: System Settings → General → Login Options → disable Automatic login
-   Evidence:
-     • Automatic login: username
-
-🟠 [SSH-003] SSH service is running
-   Category:    network
-   Severity:    HIGH
-   Description: SSH daemon is running and accepting connections.
-                If not needed, disable it to reduce attack surface.
-   Remediation: System Settings → General → Sharing → Remote Login → disable
-   Evidence:
-     • com.openssh.sshd is loaded and running
-
-...
-
-└──────────────────────────────────────────────────────────┘
-```
 
 ---
 
