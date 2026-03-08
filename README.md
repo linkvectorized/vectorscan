@@ -105,11 +105,36 @@ sudo ./vectorscan
 ## Output formats
 
 ```bash
-./vectorscan                    # Table (default) — colored terminal output
-./vectorscan -output json       # JSON — pipe to jq, feed to dashboards
-./vectorscan -output csv        # CSV — spreadsheets, compliance reports
-./vectorscan -output markdown   # Markdown — paste into docs or tickets
+./vectorscan                        # Table (default) — colored terminal output
+./vectorscan -output json           # JSON — pipe to jq, feed to dashboards
+./vectorscan -output csv            # CSV — spreadsheets, compliance reports
+./vectorscan -output markdown       # Markdown — paste into docs or tickets
+./vectorscan -output web            # Browser dashboard — interactive, filterable
+./vectorscan -output web -port 3000 # Dashboard on a custom port (default: 8080)
 ```
+
+---
+
+## Web dashboard
+
+```bash
+sudo vectorscan -output web
+```
+
+Runs a local HTTP server after the scan and opens your browser automatically.
+
+- **Safe to close the terminal** — server detaches and keeps running in the background
+- **Auto-shuts down** when you close the browser tab — no orphaned processes, no cleanup
+- Navigate to `http://localhost:8080` manually if the browser doesn't open
+- Custom port: `-port 3000`
+
+**Dashboard features:**
+- Security score gauge with status (EXCELLENT / GOOD / FAIR / POOR / CRITICAL)
+- Severity and category breakdown charts
+- Filterable findings table — search by keyword, filter by severity, category, or status
+- Issues Only view by default — passing checks hidden unless you want them
+- Green arrow on passing checks when viewing all findings
+- Export to CSV, JSON, or PDF
 
 ---
 

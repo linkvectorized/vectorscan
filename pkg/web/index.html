@@ -742,11 +742,14 @@
 
                 const tr = document.createElement('tr');
                 tr.className = cls;
+                const patchedBadge = f.passed
+                    ? ' <span style="color:var(--low);font-weight:700;font-size:13px" title="Patched / passing">&#10140;</span>'
+                    : '';
                 tr.innerHTML = `
                     <td><span class="expand-toggle">▶</span> ${escapeHtml(f.id)}</td>
                     <td>${severityCell}</td>
                     <td>${escapeHtml(f.category)}</td>
-                    <td>${escapeHtml(f.title)}</td>
+                    <td>${escapeHtml(f.title)}${patchedBadge}</td>
                     <td>${new Date(f.timestamp).toLocaleTimeString()}</td>
                 `;
                 tr.onclick = () => toggleRow(idx);
