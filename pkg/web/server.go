@@ -163,18 +163,28 @@ func Serve(report *models.Report, port int) error {
 	return nil
 }
 
-// openBrowser attempts to open the URL in the default browser
+// openBrowser attempts to open the URL in the default browser.
+// When running under sudo, we drop back to the original user so their
+// default browser (not root's) is used.
 func openBrowser(url string) {
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = exec.Command("open", url)
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			cmd = exec.Command("sudo", "-u", sudoUser, "open", url)
+		} else {
+			cmd = exec.Command("open", url)
+		}
 	case "linux":
-		cmd = exec.Command("xdg-open", url)
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			cmd = exec.Command("sudo", "-u", sudoUser, "xdg-open", url)
+		} else {
+			cmd = exec.Command("xdg-open", url)
+		}
 	case "windows":
 		cmd = exec.Command("start", url)
 	default:
 		return
 	}
-	_ = cmd.Start() // Start async — don't block waiting for browser to close
+	_ = cmd.Start()
 }
