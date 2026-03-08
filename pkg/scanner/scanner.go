@@ -108,7 +108,7 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 		totalChecks := 23
 		switch s.platform {
 		case "darwin":
-			totalChecks += 39
+			totalChecks += 41
 		case "linux":
 			totalChecks += 25
 		}
@@ -434,6 +434,14 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 			if f, err := s.checkAppStoreUnknownSources(scanCtx); err == nil && f != nil {
 				findings <- *f
 			}
+			reportProgress("Application auto-updates")
+			if f, err := s.checkApplicationAutoUpdates(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Remote management")
+			if f, err := s.checkRemoteManagement(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
 		}
 
 		// ── Linux-specific checks (7) ─────────────────────────────────────
@@ -553,22 +561,10 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 		}
 	}()
 
-	// Collect findings until channel closes (with timeout protection)
-	done := false
-	for !done {
-		select {
-		case f, ok := <-findings:
-			if !ok {
-				done = true
-			} else {
-				s.report.Findings = append(s.report.Findings, f)
-			}
-		case <-time.After(15 * time.Second):
-			// Timeout: cancel scan context to unblock the goroutine
-			scanCancel()
-			fmt.Fprintf(os.Stderr, "\nWarning: Scan timeout, closing early with collected findings\n")
-			done = true
-		}
+	// Collect findings until channel closes.
+	// The parent scanCtx (5-minute timeout from main.go) handles the overall deadline.
+	for f := range findings {
+		s.report.Findings = append(s.report.Findings, f)
 	}
 
 	s.report.ScanTime = time.Since(startTime)

@@ -3,12 +3,30 @@ package scanner
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/linkvectorized/vectorscan/pkg/models"
 )
+
+// userHomeDir returns the effective user's home directory, accounting for sudo.
+// When running under sudo, this returns the original user's home, not root's.
+func (s *Scanner) userHomeDir(ctx context.Context) string {
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" && !strings.ContainsAny(sudoUser, " \t\n;|&$`\"'\\(){}[]") {
+		if h, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("echo ~%s", sudoUser)); err == nil {
+			home := strings.TrimSpace(h)
+			if home != "" && !strings.HasPrefix(home, "~") {
+				return home
+			}
+		}
+	}
+	if h, err := s.platform_util.RunCommand(ctx, "sh", "-c", "echo ~"); err == nil {
+		return strings.TrimSpace(h)
+	}
+	return os.Getenv("HOME")
+}
 
 // checkSudoersConfig checks for insecure sudoers configurations
 func (s *Scanner) checkSudoersConfig(ctx context.Context) (*models.Finding, error) {
@@ -17,8 +35,19 @@ func (s *Scanner) checkSudoersConfig(ctx context.Context) (*models.Finding, erro
 		return nil, nil // File might not exist or not readable
 	}
 
-	// Check for NOPASSWD
-	if strings.Contains(content, "NOPASSWD") {
+	// Check for NOPASSWD (skip commented lines)
+	hasNOPASSWD := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") || trimmed == "" {
+			continue
+		}
+		if strings.Contains(trimmed, "NOPASSWD") {
+			hasNOPASSWD = true
+			break
+		}
+	}
+	if hasNOPASSWD {
 		return &models.Finding{
 			ID:          "PERM-001",
 			Category:    "permissions",
@@ -54,6 +83,7 @@ func (s *Scanner) checkSudoersConfig(ctx context.Context) (*models.Finding, erro
 		Description: "Sudoers file does not contain dangerous configurations like NOPASSWD",
 		Remediation: "No action needed",
 		Evidence:    []string{"Sudoers is properly configured"},
+		Passed:      true,
 		Timestamp:   time.Now(),
 	}, nil
 }
@@ -102,6 +132,7 @@ func (s *Scanner) checkWorldWritable(ctx context.Context) (*models.Finding, erro
 		Description: "Sensitive system files (/etc/passwd, /etc/shadow, etc) have proper permissions",
 		Remediation: "No action needed",
 		Evidence:    []string{"All sensitive files have restricted permissions"},
+		Passed:      true,
 		Timestamp:   time.Now(),
 	}, nil
 }
@@ -139,6 +170,7 @@ func (s *Scanner) checkSUIDFiles(ctx context.Context) (*models.Finding, error) {
 		Description: "System has an acceptable number of SUID binaries",
 		Remediation: "No action needed",
 		Evidence:    []string{fmt.Sprintf("Found %s SUID binaries (acceptable)", strings.TrimSpace(output))},
+		Passed:      true,
 		Timestamp:   time.Now(),
 	}, nil
 }
@@ -172,6 +204,7 @@ func (s *Scanner) checkSIP(ctx context.Context) (*models.Finding, error) {
 		Description: "macOS System Integrity Protection (SIP) is active, protecting system integrity",
 		Remediation: "No action needed",
 		Evidence:    []string{fmt.Sprintf("csrutil status: %s", strings.TrimSpace(output))},
+		Passed:      true,
 		Timestamp:   time.Now(),
 	}, nil
 }
@@ -205,6 +238,7 @@ func (s *Scanner) checkGatekeeper(ctx context.Context) (*models.Finding, error) 
 		Description: "Gatekeeper is active, verifying code signatures and app integrity",
 		Remediation: "No action needed",
 		Evidence:    []string{fmt.Sprintf("spctl status: %s", strings.TrimSpace(output))},
+		Passed:      true,
 		Timestamp:   time.Now(),
 	}, nil
 }
@@ -251,7 +285,13 @@ func (s *Scanner) checkFirewall(ctx context.Context) (*models.Finding, error) {
 // checkOpenPorts checks for unexpected open ports
 func (s *Scanner) checkOpenPorts(ctx context.Context) (*models.Finding, error) {
 	// Get list of open ports on external interfaces
-	cmd := "netstat -an | grep LISTEN | grep -v 127.0.0.1"
+	var cmd string
+	if s.platform == "linux" {
+		// Use ss on Linux (netstat is in net-tools which may not be installed)
+		cmd = "ss -tlnp 2>/dev/null | grep -v '127.0.0.1' | grep -v '::1' | tail -n +2"
+	} else {
+		cmd = "netstat -an | grep LISTEN | grep -v 127.0.0.1 | grep -v '::1'"
+	}
 	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", cmd)
 	if err != nil {
 		return nil, nil
@@ -361,16 +401,15 @@ func (s *Scanner) checkSSHConfig(ctx context.Context) (*models.Finding, error) {
 		}
 	}
 
-	return nil, nil
+	return positiveAuditFinding("SSH-001-OK", "SSH configuration secure ✓", "SSH daemon properly configured", "SSH hardening verified"), nil
 }
 
 // checkSSHKeyPermissions checks for readable private SSH keys
 func (s *Scanner) checkSSHKeyPermissions(ctx context.Context) (*models.Finding, error) {
-	homeDir, err := s.platform_util.RunCommand(ctx, "sh", "-c", "echo ~")
-	if err != nil {
+	homeDir := s.userHomeDir(ctx)
+	if homeDir == "" {
 		return nil, nil
 	}
-	homeDir = strings.TrimSpace(homeDir)
 	sshDir := homeDir + "/.ssh"
 
 	if !s.platform_util.FileExists(sshDir) {
@@ -417,7 +456,7 @@ func (s *Scanner) checkSSHKeyPermissions(ctx context.Context) (*models.Finding, 
 		}, nil
 	}
 
-	return nil, nil
+	return positiveAuditFinding("SSH-005-OK", "SSH key permissions secure ✓", "Private keys have proper permissions", "SSH keys properly protected"), nil
 }
 
 // checkPATHHijacking checks for writable directories in PATH
@@ -500,11 +539,7 @@ func (s *Scanner) checkWritableSystemBinaries(ctx context.Context) (*models.Find
 
 // checkLaunchAgentsPermissions checks for writable LaunchAgents directory
 func (s *Scanner) checkLaunchAgentsPermissions(ctx context.Context) (*models.Finding, error) {
-	homeDir, err := s.platform_util.RunCommand(ctx, "sh", "-c", "echo ~")
-	if err != nil {
-		return positiveAuditFinding("PERSIST-001-OK", "LaunchAgents permissions secure ✓", "LaunchAgents directory has proper permissions", "LaunchAgents directory is properly secured"), nil
-	}
-	homeDir = strings.TrimSpace(homeDir)
+	homeDir := s.userHomeDir(ctx)
 	launchDir := homeDir + "/Library/LaunchAgents"
 
 	if !s.platform_util.FileExists(launchDir) {
@@ -534,7 +569,8 @@ func (s *Scanner) checkLaunchAgentsPermissions(ctx context.Context) (*models.Fin
 
 // checkScreenLockTimeout checks screen lock and sleep settings
 func (s *Scanner) checkScreenLockTimeout(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read com.apple.screensaver askForPassword 2>/dev/null")
+	homeDir := s.userHomeDir(ctx)
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("plutil -p %s/Library/Preferences/com.apple.screensaver.plist 2>/dev/null | grep askForPassword", homeDir))
 	if err != nil || !strings.Contains(output, "1") {
 		return &models.Finding{
 			ID:          "PHYS-001",
@@ -548,7 +584,7 @@ func (s *Scanner) checkScreenLockTimeout(ctx context.Context) (*models.Finding, 
 		}, nil
 	}
 
-	return nil, nil
+	return positiveAuditFinding("PHYS-001-OK", "Screen lock enabled ✓", "Screen lock password required on wake", "Physical access protection active"), nil
 }
 
 // checkFileVaultStatus checks if FileVault encryption is enabled
@@ -579,17 +615,14 @@ func (s *Scanner) checkFileVaultStatus(ctx context.Context) (*models.Finding, er
 		Description: "Full disk encryption is enabled, protecting data if device is lost or stolen.",
 		Remediation: "No action needed",
 		Evidence:    []string{"FileVault: enabled"},
+		Passed:      true,
 		Timestamp:   time.Now(),
 	}, nil
 }
 
 // checkShellConfigPermissions checks .bashrc, .zshrc for write permissions
 func (s *Scanner) checkShellConfigPermissions(ctx context.Context) (*models.Finding, error) {
-	homeDir, err := s.platform_util.RunCommand(ctx, "sh", "-c", "echo ~")
-	if err != nil {
-		return positiveAuditFinding("PERSIST-002-OK", "Shell configs permissions secure ✓", "Shell configuration files have proper permissions", "Shell configs are properly secured"), nil
-	}
-	homeDir = strings.TrimSpace(homeDir)
+	homeDir := s.userHomeDir(ctx)
 
 	shellFiles := []string{
 		homeDir + "/.bashrc",
@@ -633,11 +666,7 @@ func (s *Scanner) checkShellConfigPermissions(ctx context.Context) (*models.Find
 
 // checkSSHStrictHostKeyChecking checks SSH config for host key verification
 func (s *Scanner) checkSSHStrictHostKeyChecking(ctx context.Context) (*models.Finding, error) {
-	homeDir, err := s.platform_util.RunCommand(ctx, "sh", "-c", "echo ~")
-	if err != nil {
-		return nil, nil
-	}
-	homeDir = strings.TrimSpace(homeDir)
+	homeDir := s.userHomeDir(ctx)
 	sshConfigPath := homeDir + "/.ssh/config"
 
 	if !s.platform_util.FileExists(sshConfigPath) {
@@ -662,16 +691,12 @@ func (s *Scanner) checkSSHStrictHostKeyChecking(ctx context.Context) (*models.Fi
 		}, nil
 	}
 
-	return nil, nil
+	return positiveAuditFinding("SSH-004-OK", "SSH host key checking enabled ✓", "StrictHostKeyChecking not disabled", "MITM protection active"), nil
 }
 
 // checkCredentialsInHome checks for exposed credential files
 func (s *Scanner) checkCredentialsInHome(ctx context.Context) (*models.Finding, error) {
-	homeDir, err := s.platform_util.RunCommand(ctx, "sh", "-c", "echo ~")
-	if err != nil {
-		return positiveAuditFinding("CREDS-001-OK", "Credential files permissions secure ✓", "Credential files have proper permissions", "Credentials are properly protected"), nil
-	}
-	homeDir = strings.TrimSpace(homeDir)
+	homeDir := s.userHomeDir(ctx)
 
 	credentialFiles := []string{
 		homeDir + "/.aws/credentials",
@@ -744,15 +769,16 @@ func (s *Scanner) checkXProtectStatus(ctx context.Context) (*models.Finding, err
 		Description: "Apple's XProtect scans downloaded files and applications for malware.",
 		Remediation: "No action needed",
 		Evidence:    []string{"XProtect is installed and enabled"},
+		Passed:      true,
 		Timestamp:   time.Now(),
 	}, nil
 }
 
 // checkGuestAccountEnabled checks if guest account is enabled
 func (s *Scanner) checkGuestAccountEnabled(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read /Library/Preferences/com.apple.loginwindow GuestEnabled 2>/dev/null")
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p /Library/Preferences/com.apple.loginwindow.plist 2>/dev/null | grep GuestEnabled")
 	if err != nil || !strings.Contains(output, "1") {
-		return nil, nil
+		return positiveAuditFinding("PHYS-003-OK", "Guest account disabled ✓", "Guest account not enabled", "Unauthorized physical access prevented"), nil
 	}
 
 	return &models.Finding{
@@ -769,7 +795,7 @@ func (s *Scanner) checkGuestAccountEnabled(ctx context.Context) (*models.Finding
 
 // checkAutomaticLoginEnabled checks if automatic login is enabled
 func (s *Scanner) checkAutomaticLoginEnabled(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null")
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p /Library/Preferences/com.apple.loginwindow.plist 2>/dev/null | grep autoLoginUser")
 	if err == nil && strings.TrimSpace(output) != "" {
 		return &models.Finding{
 			ID:          "PHYS-004",
@@ -783,16 +809,12 @@ func (s *Scanner) checkAutomaticLoginEnabled(ctx context.Context) (*models.Findi
 		}, nil
 	}
 
-	return nil, nil
+	return positiveAuditFinding("PHYS-004-OK", "Automatic login disabled ✓", "Login screen required", "Physical access protection active"), nil
 }
 
 // checkGitConfigSecurity checks for dangerous git configurations
 func (s *Scanner) checkGitConfigSecurity(ctx context.Context) (*models.Finding, error) {
-	homeDir, err := s.platform_util.RunCommand(ctx, "sh", "-c", "echo ~")
-	if err != nil {
-		return nil, nil
-	}
-	homeDir = strings.TrimSpace(homeDir)
+	homeDir := s.userHomeDir(ctx)
 	gitConfig := homeDir + "/.gitconfig"
 
 	if !s.platform_util.FileExists(gitConfig) {
@@ -817,7 +839,7 @@ func (s *Scanner) checkGitConfigSecurity(ctx context.Context) (*models.Finding, 
 		}, nil
 	}
 
-	return nil, nil
+	return positiveAuditFinding("DEV-001-OK", "Git SSL verification enabled ✓", "Git operations use SSL verification", "MITM protection active"), nil
 }
 
 // isWritableByGroupOrOthers checks if perms allow write by group or others
@@ -883,7 +905,7 @@ func (s *Scanner) checkSystemUpdates(ctx context.Context) (*models.Finding, erro
 
 // checkBluetoothDiscoverability checks if Bluetooth is set to non-discoverable
 func (s *Scanner) checkBluetoothDiscoverability(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read /Library/Preferences/com.apple.Bluetooth ControllerPowerState 2>/dev/null")
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p /Library/Preferences/com.apple.Bluetooth.plist 2>/dev/null | grep ControllerPowerState")
 	if err != nil || strings.TrimSpace(output) == "" {
 		return positiveAuditFinding("HW-001-OK", "Bluetooth configuration OK ✓", "Bluetooth settings are configured", "Bluetooth discovery settings OK"), nil
 	}
@@ -1023,8 +1045,7 @@ func (s *Scanner) checkDNSOverHTTPS(ctx context.Context) (*models.Finding, error
 
 // checkBrowserSecurity checks browser security settings
 func (s *Scanner) checkBrowserSecurity(ctx context.Context) (*models.Finding, error) {
-	homeDir, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "echo ~")
-	homeDir = strings.TrimSpace(homeDir)
+	homeDir := s.userHomeDir(ctx)
 
 	// Check if Chrome/Safari store passwords unencrypted
 	chromePrefs := homeDir + "/Library/Application Support/Google/Chrome/Default/Preferences"
@@ -1076,7 +1097,8 @@ func (s *Scanner) checkiCloudKeychain(ctx context.Context) (*models.Finding, err
 
 // checkAppleID2FA checks if 2FA is enabled for Apple ID
 func (s *Scanner) checkAppleID2FA(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read ~/Library/Preferences/com.apple.account.IdentityServices 2>/dev/null | grep -i 'two-factor\\|2FA\\|twofactor'")
+	homeDir := s.userHomeDir(ctx)
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("plutil -p %s/Library/Preferences/com.apple.account.IdentityServices.plist 2>/dev/null | grep -i 'two-factor\\|2FA\\|twofactor'", homeDir))
 	if err == nil && strings.TrimSpace(output) != "" {
 		return positiveAuditFinding("CLOUD-002-OK", "Apple ID 2FA enabled ✓", "Two-factor authentication is active", "Apple ID account is protected with 2FA"), nil
 	}
@@ -1308,7 +1330,7 @@ func (s *Scanner) checkAccountLockout(ctx context.Context) (*models.Finding, err
 	}
 
 	// macOS
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read /Library/Preferences/com.apple.loginwindow 2>/dev/null | grep -i 'MaxFailedAttempts\\|lockLockoutDuration'")
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p /Library/Preferences/com.apple.loginwindow.plist 2>/dev/null | grep -i 'MaxFailedAttempts\\|lockLockoutDuration'")
 	if err != nil || strings.TrimSpace(output) == "" {
 		return &models.Finding{
 			ID:          "AUTH-004",
@@ -1434,18 +1456,41 @@ func (s *Scanner) checkKernelPanicAutoReboot(ctx context.Context) (*models.Findi
 
 // checkCoreDumps checks if core dumps are disabled
 func (s *Scanner) checkCoreDumps(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "launchctl limit core 2>/dev/null")
-	if err == nil && !strings.Contains(output, "0 0") && strings.Contains(output, "unlimited") {
-		return &models.Finding{
-			ID:          "KERNEL-003",
-			Category:    "kernel",
-			Severity:    models.SeverityMedium,
-			Title:       "Core dumps enabled",
-			Description: "Core dumps are enabled. These files can contain sensitive memory information.",
-			Remediation: "To permanently disable core dumps on macOS, create /Library/LaunchDaemons/limit.corefile.plist with a core limit of 0, then load it with: sudo launchctl load /Library/LaunchDaemons/limit.corefile.plist. For a session-only fix: ulimit -c 0",
-			Evidence:    []string{"Core dump limit is unlimited or large"},
-			Timestamp:   time.Now(),
-		}, nil
+	if s.platform == "darwin" {
+		// macOS: check launchctl core limit — format: "core    soft-limit  hard-limit"
+		output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "launchctl limit core 2>/dev/null")
+		if err == nil {
+			fields := strings.Fields(strings.TrimSpace(output))
+			// fields[0]="core", fields[1]=soft, fields[2]=hard
+			// Core dumps are only actually enabled if the soft limit is non-zero
+			if len(fields) >= 2 && fields[1] != "0" {
+				return &models.Finding{
+					ID:          "KERNEL-003",
+					Category:    "kernel",
+					Severity:    models.SeverityMedium,
+					Title:       "Core dumps enabled",
+					Description: "Core dumps are enabled. These files can contain sensitive memory information.",
+					Remediation: "To permanently disable core dumps on macOS, create /Library/LaunchDaemons/limit.corefile.plist with a core limit of 0, then load it with: sudo launchctl load /Library/LaunchDaemons/limit.corefile.plist. For a session-only fix: ulimit -c 0",
+					Evidence:    []string{fmt.Sprintf("Core dump limit: %s", strings.TrimSpace(output))},
+					Timestamp:   time.Now(),
+				}, nil
+			}
+		}
+	} else if s.platform == "linux" {
+		// Linux: check ulimit and sysctl
+		out, err := s.platform_util.RunCommand(ctx, "sh", "-c", "ulimit -c 2>/dev/null")
+		if err == nil && strings.TrimSpace(out) != "0" {
+			return &models.Finding{
+				ID:          "KERNEL-003",
+				Category:    "kernel",
+				Severity:    models.SeverityMedium,
+				Title:       "Core dumps enabled",
+				Description: "Core dumps are enabled. These files can contain sensitive memory information.",
+				Remediation: "Disable core dumps: add '* hard core 0' to /etc/security/limits.conf and set fs.suid_dumpable=0 in sysctl",
+				Evidence:    []string{fmt.Sprintf("ulimit -c: %s", strings.TrimSpace(out))},
+				Timestamp:   time.Now(),
+			}, nil
+		}
 	}
 
 	return positiveAuditFinding("KERNEL-003-OK", "Core dumps disabled ✓", "Memory dumps prevented", "Sensitive data protection active"), nil
@@ -1458,10 +1503,8 @@ func (s *Scanner) checkAccessibilityPermissions(ctx context.Context) (*models.Fi
 	// TCC.db is the definitive source for accessibility permissions on macOS.
 	// System TCC DB requires root; user TCC DB is readable without root.
 	tccDB := "/Library/Application Support/com.apple.TCC/TCC.db"
-	userTccDB := fmt.Sprintf("%s/Library/Application Support/com.apple.TCC/TCC.db", func() string {
-		h, _ := s.platform_util.RunCommand(context.Background(), "sh", "-c", "echo ~")
-		return strings.TrimSpace(h)
-	}())
+	homeDir := s.userHomeDir(ctx)
+	userTccDB := fmt.Sprintf("%s/Library/Application Support/com.apple.TCC/TCC.db", homeDir)
 
 	queryTCC := func(db string) string {
 		out, _ := s.platform_util.RunCommand(ctx, "sh", "-c",
@@ -1506,7 +1549,7 @@ func (s *Scanner) checkAccessibilityPermissions(ctx context.Context) (*models.Fi
 
 // checkLocationServices checks if location services and privacy is configured
 func (s *Scanner) checkLocationServices(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read /var/db/locationd/clients.plist 2>/dev/null | grep -c 'BundleIdentifier'")
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p /var/db/locationd/clients.plist 2>/dev/null | grep -c 'BundleIdentifier'")
 	if err == nil && strings.TrimSpace(output) != "0" {
 		count := strings.TrimSpace(output)
 		return &models.Finding{
@@ -1585,21 +1628,16 @@ func (s *Scanner) checkNotarization(ctx context.Context) (*models.Finding, error
 
 // checkSSHKeyAlgorithms checks for weak SSH key algorithms
 func (s *Scanner) checkSSHKeyAlgorithms(ctx context.Context) (*models.Finding, error) {
-	// Use RunCommand to resolve home dir rather than trusting $HOME env var
-	homeDir, err := s.platform_util.RunCommand(ctx, "sh", "-c", "echo ~")
-	if err != nil {
-		return positiveAuditFinding("SSH-004-OK", "SSH key algorithms checked ✓", "SSH keys properly configured", "Standard key algorithms in use"), nil
-	}
-	homeDir = strings.TrimSpace(homeDir)
+	homeDir := s.userHomeDir(ctx)
 	rsaKeyPath := homeDir + "/.ssh/id_rsa"
 	if !s.platform_util.FileExists(rsaKeyPath) {
-		return positiveAuditFinding("SSH-004-OK", "SSH key algorithms checked ✓", "SSH keys properly configured", "Standard key algorithms in use"), nil
+		return positiveAuditFinding("SSH-006-OK", "SSH key algorithms checked ✓", "SSH keys properly configured", "Standard key algorithms in use"), nil
 	}
 
 	output, _ := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("ssh-keygen -l -f \"%s/.ssh/id_rsa\" 2>/dev/null | grep -i '1024\\|512'", strings.ReplaceAll(homeDir, `"`, `\"`)))
 	if strings.TrimSpace(output) != "" {
 		return &models.Finding{
-			ID:          "SSH-004",
+			ID:          "SSH-006",
 			Category:    "network",
 			Severity:    models.SeverityHigh,
 			Title:       "Weak SSH key length detected",
@@ -1610,7 +1648,7 @@ func (s *Scanner) checkSSHKeyAlgorithms(ctx context.Context) (*models.Finding, e
 		}, nil
 	}
 
-	return positiveAuditFinding("SSH-004-OK", "SSH key algorithms strong ✓", "RSA 2048+ or ED25519 in use", "Secure key exchange active"), nil
+	return positiveAuditFinding("SSH-006-OK", "SSH key algorithms strong ✓", "RSA 2048+ or ED25519 in use", "Secure key exchange active"), nil
 }
 
 // checkWeakCiphers checks SSH server config for explicitly configured weak ciphers
@@ -1661,21 +1699,33 @@ func (s *Scanner) checkWeakCiphers(ctx context.Context) (*models.Finding, error)
 
 // checkDNSSECValidation checks if DNSSEC validation is enabled
 func (s *Scanner) checkDNSSECValidation(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "cat /etc/resolv.conf 2>/dev/null | grep -i 'dnssec'")
-	if err != nil || strings.TrimSpace(output) == "" {
-		return &models.Finding{
-			ID:          "DNS-002",
-			Category:    "network",
-			Severity:    models.SeverityLow,
-			Title:       "DNSSEC validation not enabled",
-			Description: "DNSSEC validation is not configured. DNS responses are not validated for authenticity.",
-			Remediation: fmt.Sprintf("Configure DNSSEC: edit /etc/resolv.conf or use %s → Network → DNS", s.systemSettings()),
-			Evidence:    []string{"DNSSEC not found in DNS configuration"},
-			Timestamp:   time.Now(),
-		}, nil
+	if s.platform == "linux" {
+		// Check systemd-resolved for DNSSEC support
+		out, err := s.platform_util.RunCommand(ctx, "sh", "-c", "resolvectl status 2>/dev/null | grep -i 'DNSSEC'")
+		if err == nil && strings.Contains(strings.ToLower(out), "yes") {
+			return positiveAuditFinding("DNS-002-OK", "DNSSEC validation enabled ✓", "systemd-resolved DNSSEC active", "DNS spoofing protection active"), nil
+		}
+		// Check unbound DNSSEC configuration
+		if s.platform_util.FileExists("/etc/unbound/unbound.conf") {
+			content, _ := s.platform_util.ReadFile("/etc/unbound/unbound.conf")
+			if strings.Contains(content, "auto-trust-anchor-file") || strings.Contains(content, "trust-anchor-file") {
+				return positiveAuditFinding("DNS-002-OK", "DNSSEC validation enabled ✓", "Unbound configured with trust anchors", "DNS spoofing protection active"), nil
+			}
+		}
 	}
 
-	return positiveAuditFinding("DNS-002-OK", "DNSSEC validation enabled ✓", "DNS authenticity verified", "DNS spoofing protection active"), nil
+	// On macOS, DNSSEC depends on the upstream resolver (1.1.1.1, 8.8.8.8, 9.9.9.9 all validate DNSSEC)
+	// This is already partially covered by checkDNSOverHTTPS
+	return &models.Finding{
+		ID:          "DNS-002",
+		Category:    "network",
+		Severity:    models.SeverityLow,
+		Title:       "DNSSEC validation not confirmed",
+		Description: "DNSSEC validation could not be confirmed. DNS responses may not be validated for authenticity.",
+		Remediation: "Use a DNSSEC-validating resolver (1.1.1.1, 8.8.8.8, 9.9.9.9) or configure a local validating resolver like unbound.",
+		Evidence:    []string{"No local DNSSEC validation detected"},
+		Timestamp:   time.Now(),
+	}, nil
 }
 
 // checkBonjourMDNS checks if Bonjour/mDNS is disabled on enterprise networks
@@ -1699,14 +1749,30 @@ func (s *Scanner) checkBonjourMDNS(ctx context.Context) (*models.Finding, error)
 
 // Logging & Monitoring Checks
 
-// checkAuditLogging checks if system audit logging is enabled (macOS BSD audit)
+// checkAuditLogging checks if system audit logging is enabled
 func (s *Scanner) checkAuditLogging(ctx context.Context) (*models.Finding, error) {
-	// Check if auditd is running via launchctl (service-specific query is more reliable than piped grep)
+	if s.platform == "linux" {
+		// Linux: check auditd service
+		out, err := s.platform_util.RunCommand(ctx, "systemctl", "is-active", "auditd")
+		if err == nil && strings.TrimSpace(out) == "active" {
+			return positiveAuditFinding("AUDIT-001-OK", "Audit logging enabled ✓", "auditd service active", "Security events tracked via Linux audit framework"), nil
+		}
+		return &models.Finding{
+			ID:          "AUDIT-001",
+			Category:    "audit",
+			Severity:    models.SeverityMedium,
+			Title:       "Audit daemon not running",
+			Description: "Linux auditd service is not active. Security events are not being logged.",
+			Remediation: "Install and enable auditd: sudo apt install auditd && sudo systemctl enable --now auditd",
+			Evidence:    []string{"auditd service not active"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+
+	// macOS: check BSD auditd via launchctl
 	auditdRunning, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "launchctl list com.apple.auditd 2>/dev/null")
-	// Check audit_control for active flags
 	auditControl, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "cat /etc/security/audit_control 2>/dev/null | grep -v '^#' | grep -v '^$'")
 
-	// launchctl list <label> returns error text on macOS if service not found
 	trimmedRunning := strings.TrimSpace(auditdRunning)
 	auditdActive := trimmedRunning != "" &&
 		!strings.Contains(trimmedRunning, "Could not find") &&
@@ -1774,15 +1840,40 @@ func (s *Scanner) checkSystemLogRetention(ctx context.Context) (*models.Finding,
 
 // checkSyslogForwarding checks if logs are sent to central logging
 func (s *Scanner) checkSyslogForwarding(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "cat /etc/syslog.conf 2>/dev/null | grep '@'")
-	if err != nil || strings.TrimSpace(output) == "" {
+	found := false
+	if s.platform == "linux" {
+		// Linux: check rsyslog config (modern Linux uses /etc/rsyslog.conf and /etc/rsyslog.d/)
+		out, err := s.platform_util.RunCommand(ctx, "sh", "-c", "cat /etc/rsyslog.conf /etc/rsyslog.d/*.conf 2>/dev/null | grep -v '^#' | grep '@'")
+		if err == nil && strings.TrimSpace(out) != "" {
+			found = true
+		}
+		// Also check if systemd journal forwarding is configured
+		if !found {
+			out, err = s.platform_util.RunCommand(ctx, "sh", "-c", "cat /etc/systemd/journal-remote.conf 2>/dev/null | grep -i 'URL'")
+			if err == nil && strings.TrimSpace(out) != "" {
+				found = true
+			}
+		}
+	} else {
+		// macOS: check /etc/syslog.conf
+		out, err := s.platform_util.RunCommand(ctx, "sh", "-c", "cat /etc/syslog.conf 2>/dev/null | grep '@'")
+		if err == nil && strings.TrimSpace(out) != "" {
+			found = true
+		}
+	}
+
+	if !found {
+		remediation := "Configure syslog forwarding: Edit /etc/syslog.conf to add: *.* @logging-server.example.com"
+		if s.platform == "linux" {
+			remediation = "Configure rsyslog forwarding: add '*.* @@logging-server.example.com:514' to /etc/rsyslog.d/remote.conf and restart rsyslog"
+		}
 		return &models.Finding{
 			ID:          "AUDIT-003",
 			Category:    "audit",
 			Severity:    models.SeverityLow,
 			Title:       "Syslog forwarding not configured",
 			Description: "Logs are not forwarded to a central logging server. Implement centralized log management.",
-			Remediation: "Configure syslog forwarding: Edit /etc/syslog.conf to add: *.* @logging-server.example.com",
+			Remediation: remediation,
 			Evidence:    []string{"No syslog forwarding configured"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1793,7 +1884,8 @@ func (s *Scanner) checkSyslogForwarding(ctx context.Context) (*models.Finding, e
 
 // checkCrashReporter checks if automatic crash reporting is appropriately configured
 func (s *Scanner) checkCrashReporter(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read ~/Library/Preferences/com.apple.CrashReporter 2>/dev/null | grep -i 'DialogType'")
+	homeDir := s.userHomeDir(ctx)
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("plutil -p %s/Library/Preferences/com.apple.CrashReporter.plist 2>/dev/null | grep -i 'DialogType'", homeDir))
 	if err == nil && strings.Contains(output, "Server") {
 		return &models.Finding{
 			ID:          "AUDIT-004",
@@ -1814,8 +1906,8 @@ func (s *Scanner) checkCrashReporter(ctx context.Context) (*models.Finding, erro
 
 // checkSleepIdleTimeout checks if sleep/idle timeout is configured
 func (s *Scanner) checkSleepIdleTimeout(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "pmset -g | grep 'disksleep\\|sleep' | grep '0'")
-	if err == nil && strings.TrimSpace(output) != "" {
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "pmset -g | grep ' sleep ' | awk '{print $2}'")
+	if err == nil && strings.TrimSpace(output) == "0" {
 		return &models.Finding{
 			ID:          "CONFIG-001",
 			Category:    "configuration",
@@ -1833,15 +1925,54 @@ func (s *Scanner) checkSleepIdleTimeout(ctx context.Context) (*models.Finding, e
 
 // checkTimeSync checks if NTP time synchronization is enabled
 func (s *Scanner) checkTimeSync(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "launchctl list | grep -i 'ntpd\\|systemtime' || sntp -c 1 127.0.0.1 2>&1")
-	if err != nil || strings.Contains(output, "Connection refused") {
+	synced := false
+
+	if s.platform == "linux" {
+		// Linux: check timedatectl or systemd-timesyncd
+		out, err := s.platform_util.RunCommand(ctx, "sh", "-c", "timedatectl show 2>/dev/null | grep 'NTPSynchronized=yes'")
+		if err == nil && strings.TrimSpace(out) != "" {
+			synced = true
+		}
+		if !synced {
+			out, err = s.platform_util.RunCommand(ctx, "systemctl", "is-active", "systemd-timesyncd")
+			if err == nil && strings.TrimSpace(out) == "active" {
+				synced = true
+			}
+		}
+		if !synced {
+			out, err = s.platform_util.RunCommand(ctx, "systemctl", "is-active", "ntpd")
+			if err == nil && strings.TrimSpace(out) == "active" {
+				synced = true
+			}
+		}
+		if !synced {
+			out, err = s.platform_util.RunCommand(ctx, "systemctl", "is-active", "chronyd")
+			if err == nil && strings.TrimSpace(out) == "active" {
+				synced = true
+			}
+		}
+	} else {
+		// macOS: check launchctl for NTP services
+		output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "launchctl list | grep -i 'ntpd\\|systemtime'")
+		if err == nil && strings.TrimSpace(output) != "" {
+			synced = true
+		}
+	}
+
+	if !synced {
+		remediation := "Enable NTP time sync"
+		if s.platform == "darwin" {
+			remediation = fmt.Sprintf("Enable NTP: %s → General → Date & Time → Set time and date automatically", s.systemSettings())
+		} else {
+			remediation = "Enable NTP: sudo timedatectl set-ntp true  or install chronyd/ntpd"
+		}
 		return &models.Finding{
 			ID:          "CONFIG-002",
 			Category:    "configuration",
 			Severity:    models.SeverityMedium,
 			Title:       "Time synchronization may be disabled",
 			Description: "NTP (Network Time Protocol) may not be properly configured. Incorrect time breaks security mechanisms.",
-			Remediation: fmt.Sprintf("Enable NTP: %s → General → Date & Time → Set time and date automatically", s.systemSettings()),
+			Remediation: remediation,
 			Evidence:    []string{"NTP synchronization not detected"},
 			Timestamp:   time.Now(),
 		}, nil
@@ -1894,8 +2025,9 @@ func (s *Scanner) checkFirmwareUpdates(ctx context.Context) (*models.Finding, er
 
 // checkApplicationAutoUpdates checks if applications auto-update
 func (s *Scanner) checkApplicationAutoUpdates(ctx context.Context) (*models.Finding, error) {
-	safariUpdates, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read ~/Library/Preferences/com.apple.Safari 2>/dev/null | grep -i 'SUEnableAutomaticChecks'")
-	chromeUpdates, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read ~/Library/Preferences/com.google.Chrome 2>/dev/null | grep -i 'auto.*.update'")
+	homeDir := s.userHomeDir(ctx)
+	safariUpdates, _ := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("plutil -p %s/Library/Preferences/com.apple.Safari.plist 2>/dev/null | grep -i 'SUEnableAutomaticChecks'", homeDir))
+	chromeUpdates, _ := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("plutil -p %s/Library/Preferences/com.google.Chrome.plist 2>/dev/null | grep -i 'auto.*update'", homeDir))
 
 	if (strings.Contains(safariUpdates, "false") || safariUpdates == "") && (strings.Contains(chromeUpdates, "false") || chromeUpdates == "") {
 		return &models.Finding{
@@ -1915,7 +2047,7 @@ func (s *Scanner) checkApplicationAutoUpdates(ctx context.Context) (*models.Find
 
 // checkRemoteManagement checks if remote management/screen sharing is disabled
 func (s *Scanner) checkRemoteManagement(ctx context.Context) (*models.Finding, error) {
-	ardEnabled, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "defaults read /Library/Preferences/com.apple.RemoteManagement 2>/dev/null | grep -i 'active'")
+	ardEnabled, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p /Library/Preferences/com.apple.RemoteManagement.plist 2>/dev/null | grep -i 'active'")
 	vnEnabled, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "launchctl list | grep -i 'screensharing\\|vnc'")
 
 	if strings.Contains(ardEnabled, "true") || strings.TrimSpace(vnEnabled) != "" {
@@ -1938,7 +2070,8 @@ func (s *Scanner) checkRemoteManagement(ctx context.Context) (*models.Finding, e
 
 // checkSpotlightTelemetry checks if Spotlight sends usage data to Apple
 func (s *Scanner) checkSpotlightTelemetry(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p ~/Library/Preferences/com.apple.Spotlight.plist 2>/dev/null | grep -i 'InternetResults\\|Suggestions'")
+	homeDir := s.userHomeDir(ctx)
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("plutil -p %s/Library/Preferences/com.apple.Spotlight.plist 2>/dev/null | grep -i 'InternetResults\\|Suggestions'", homeDir))
 	if err == nil && strings.Contains(output, "true") {
 		return &models.Finding{
 			ID:          "TELEMETRY-001",
@@ -1957,7 +2090,8 @@ func (s *Scanner) checkSpotlightTelemetry(ctx context.Context) (*models.Finding,
 
 // checkSiriAnalytics checks if Siri analytics are disabled
 func (s *Scanner) checkSiriAnalytics(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p ~/Library/Preferences/com.apple.assistant.support.plist 2>/dev/null | grep -i 'Siri Data Sharing Opt'")
+	homeDir := s.userHomeDir(ctx)
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("plutil -p %s/Library/Preferences/com.apple.assistant.support.plist 2>/dev/null | grep -i 'Siri Data Sharing Opt'", homeDir))
 	if err == nil && strings.Contains(output, "true") {
 		return &models.Finding{
 			ID:          "TELEMETRY-002",
@@ -1976,7 +2110,8 @@ func (s *Scanner) checkSiriAnalytics(ctx context.Context) (*models.Finding, erro
 
 // checkAppleAnalytics checks if Apple analytics are disabled
 func (s *Scanner) checkAppleAnalytics(ctx context.Context) (*models.Finding, error) {
-	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p ~/Library/Application\\ Support/CrashReporter/DiagnosticMessagesHistory.plist 2>/dev/null | grep -i 'AutoSubmit\\|Agree'")
+	homeDir := s.userHomeDir(ctx)
+	output, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("plutil -p \"%s/Library/Application Support/CrashReporter/DiagnosticMessagesHistory.plist\" 2>/dev/null | grep -i 'AutoSubmit\\|Agree'", homeDir))
 	if err == nil && strings.Contains(output, "true") {
 		return &models.Finding{
 			ID:          "TELEMETRY-003",
@@ -1995,9 +2130,13 @@ func (s *Scanner) checkAppleAnalytics(ctx context.Context) (*models.Finding, err
 
 // checkThirdPartyDataSharing checks Safari and third-party app data sharing settings
 func (s *Scanner) checkThirdPartyDataSharing(ctx context.Context) (*models.Finding, error) {
-	safariTracking, _ := s.platform_util.RunCommand(ctx, "sh", "-c", "plutil -p ~/Library/Preferences/com.apple.Safari.plist 2>/dev/null | grep -i 'Privacy\\|Tracking' | head -3")
+	homeDir := s.userHomeDir(ctx)
+	// Check specific Safari privacy keys rather than a broad grep
+	safariPrefs, _ := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("plutil -p %s/Library/Preferences/com.apple.Safari.plist 2>/dev/null", homeDir))
+	// SendDoNotTrackHTTPHeader=0/false means privacy is weak
+	dntDisabled := strings.Contains(safariPrefs, "\"SendDoNotTrackHTTPHeader\" => 0") || strings.Contains(safariPrefs, "\"SendDoNotTrackHTTPHeader\" => false")
 
-	if strings.Contains(safariTracking, "false") {
+	if dntDisabled {
 		return &models.Finding{
 			ID:          "TELEMETRY-004",
 			Category:    "telemetry",
@@ -2027,7 +2166,7 @@ func (s *Scanner) checkFirewallLinux(ctx context.Context) (*models.Finding, erro
 		return positiveAuditFinding("FW-001-OK", "Firewall active ✓", "ufw enabled", "Network ingress filtered"), nil
 	}
 	// Try iptables — consider active if non-default rules exist
-	if out, err := s.platform_util.RunCommand(ctx, "iptables", "-L", "-n"); err == nil && strings.Count(out, "\n") > 10 {
+	if out, err := s.platform_util.RunCommand(ctx, "iptables", "-w", "2", "-L", "-n"); err == nil && strings.Count(out, "\n") > 10 {
 		return positiveAuditFinding("FW-001-OK", "Firewall active ✓", "iptables rules present", "Network ingress filtered"), nil
 	}
 	return &models.Finding{
@@ -2203,8 +2342,8 @@ func (s *Scanner) checkRootAccountLocked(ctx context.Context) (*models.Finding, 
 		`passwd -S root 2>/dev/null | awk '{print $2}'`)
 	if err == nil {
 		status := strings.TrimSpace(out)
-		// L = locked, NP = no password (also locked effectively)
-		if status == "L" || status == "NP" {
+		// L = locked (Debian), LK = locked (RHEL), NP = no password (also locked effectively)
+		if status == "L" || status == "LK" || status == "NP" {
 			return positiveAuditFinding("AUTH-010-OK", "Root account locked ✓", "Direct root login disabled", "Root account not directly accessible"), nil
 		}
 		if status == "P" {
@@ -2284,7 +2423,7 @@ func (s *Scanner) checkSudoLoggingLinux(ctx context.Context) (*models.Finding, e
 // checkAuthorizedKeysPerms checks SSH authorized_keys file permissions for all users
 func (s *Scanner) checkAuthorizedKeysPerms(ctx context.Context) (*models.Finding, error) {
 	out, err := s.platform_util.RunCommand(ctx, "sh", "-c",
-		`find /home /root -name "authorized_keys" 2>/dev/null`)
+		`find /home /root -maxdepth 5 -name "authorized_keys" 2>/dev/null`)
 	if err != nil || strings.TrimSpace(out) == "" {
 		return positiveAuditFinding("SSH-010-OK", "No authorized_keys files found ✓", "No SSH key authorization files present", "SSH key attack surface absent"), nil
 	}
@@ -2298,12 +2437,9 @@ func (s *Scanner) checkAuthorizedKeysPerms(ctx context.Context) (*models.Finding
 		if err != nil {
 			continue
 		}
-		// authorized_keys should be 600 or 640 at most
-		if len(perms) >= 3 && perms[len(perms)-2:] != "00" && perms[len(perms)-1:] != "0" {
-			last := perms[len(perms)-1]
-			if last != '0' {
-				issues = append(issues, fmt.Sprintf("%s (perms: %s)", path, perms))
-			}
+		// authorized_keys should not be writable by group/others
+		if isWritableByGroupOrOthers(perms) {
+			issues = append(issues, fmt.Sprintf("%s (perms: %s)", path, perms))
 		}
 	}
 	if len(issues) > 0 {
@@ -2429,7 +2565,7 @@ func (s *Scanner) checkStickyBitLinux(ctx context.Context) (*models.Finding, err
 	dirs := []string{"/tmp", "/var/tmp"}
 	issues := []string{}
 	for _, dir := range dirs {
-		out, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("stat -c %%a %s 2>/dev/null", dir))
+		out, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("stat -c %%a %q 2>/dev/null", dir))
 		if err != nil {
 			continue
 		}
@@ -2462,7 +2598,7 @@ func (s *Scanner) checkCronPermissions(ctx context.Context) (*models.Finding, er
 		if !s.platform_util.FileExists(path) {
 			continue
 		}
-		out, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("stat -c '%%U %%a' %s 2>/dev/null", path))
+		out, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("stat -c '%%U %%a' %q 2>/dev/null", path))
 		if err != nil {
 			continue
 		}
@@ -2474,8 +2610,12 @@ func (s *Scanner) checkCronPermissions(ctx context.Context) (*models.Finding, er
 		if owner != "root" {
 			issues = append(issues, fmt.Sprintf("%s owned by %s (should be root)", path, owner))
 		}
-		if len(perms) > 0 && perms[len(perms)-1] != '0' {
-			issues = append(issues, fmt.Sprintf("%s is world-writable (perms: %s)", path, perms))
+		if len(perms) > 0 {
+			last := perms[len(perms)-1]
+			// Only flag actual write permissions (2=w, 3=wx, 6=rw, 7=rwx), not read-only (4=r, 5=rx)
+			if last == '2' || last == '3' || last == '6' || last == '7' {
+				issues = append(issues, fmt.Sprintf("%s is world-writable (perms: %s)", path, perms))
+			}
 		}
 	}
 	if len(issues) > 0 {
@@ -2505,8 +2645,9 @@ func (s *Scanner) checkImmutableFiles(ctx context.Context) (*models.Finding, err
 		if err != nil {
 			continue
 		}
-		// lsattr output: "----i--------e-- /etc/passwd" — 'i' flag = immutable
-		if !strings.Contains(out, "i") {
+		// lsattr output: "----i--------e-- /etc/passwd" — parse attribute field only
+		attrs := strings.SplitN(strings.TrimSpace(out), " ", 2)
+		if len(attrs) == 0 || !strings.Contains(attrs[0], "i") {
 			missing = append(missing, path)
 		}
 	}
@@ -2528,7 +2669,7 @@ func (s *Scanner) checkImmutableFiles(ctx context.Context) (*models.Finding, err
 // checkSystemdUserUnits checks for suspicious systemd units in user-writable directories
 func (s *Scanner) checkSystemdUserUnits(ctx context.Context) (*models.Finding, error) {
 	out, err := s.platform_util.RunCommand(ctx, "sh", "-c",
-		`find /home /tmp /var/tmp -name "*.service" -o -name "*.timer" 2>/dev/null | head -20`)
+		`find /home /tmp /var/tmp -maxdepth 3 -name "*.service" -o -name "*.timer" 2>/dev/null | head -20`)
 	if err != nil || strings.TrimSpace(out) == "" {
 		return positiveAuditFinding("PERSIST-010-OK", "No systemd units in user directories ✓", "No service/timer files in writable paths", "Systemd persistence injection absent"), nil
 	}
@@ -2683,8 +2824,12 @@ func (s *Scanner) checkLogTampering(ctx context.Context) (*models.Finding, error
 		}
 		checked++
 		out, err := s.platform_util.RunCommand(ctx, "lsattr", path)
-		if err == nil && strings.Contains(out, "a") {
-			protected++
+		if err == nil {
+			// lsattr output: "-----a-------e-- /var/log/auth.log" — parse attribute field only
+			attrs := strings.SplitN(strings.TrimSpace(out), " ", 2)
+			if len(attrs) > 0 && strings.Contains(attrs[0], "a") {
+				protected++
+			}
 		}
 	}
 	if checked == 0 {
