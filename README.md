@@ -13,7 +13,7 @@
 
 ![VectorScan Dashboard](assets/dashboard.png)
 
-Fast, opinionated system security audit tool. Scans your Mac for misconfigurations, weak defaults, and attack vectors — then tells you exactly what to fix. No agents, no cloud, no telemetry. Just a binary and the truth.
+Fast, opinionated system security audit tool. Scans your machine for misconfigurations, weak defaults, and attack vectors — then tells you exactly what to fix. No agents, no cloud, no telemetry. Just a binary and the truth.
 
 macOS and Linux supported. Windows coming soon.
 
@@ -22,7 +22,7 @@ macOS and Linux supported. Windows coming soon.
 ## Quick start
 
 ```bash
-# Install pre-built binary (macOS, no Go required)
+# Install pre-built binary (macOS + Linux, no Go required)
 curl -fsSL https://raw.githubusercontent.com/linkvectorized/vectorscan/master/install.sh | bash
 
 # Run
@@ -81,25 +81,26 @@ Runs a local HTTP server after the scan and opens your browser automatically.
 - Severity and category breakdown charts
 - Filterable findings table — search by keyword, filter by severity, category, or status
 - Issues Only view by default — passing checks hidden unless you want them
-- Green arrow on passing checks when viewing all findings
+- Green ✓ on passing checks when viewing all findings
 - Export to CSV, JSON, or PDF
 
 ---
 
 ## What it checks
 
-62 security checks across these categories:
+89 security checks across these categories:
 
-| Category | What it covers |
-|----------|---------------|
-| **Permissions** | Sudoers, world-writable files, SUID binaries |
-| **System** | SIP, Gatekeeper, FileVault, XProtect, firmware, secure boot |
-| **Authentication** | Password policy, account lockout, empty passwords, Touch ID for sudo |
-| **Network** | Open ports, SSH config, VPN, DNS-over-HTTPS, DNSSEC, Bonjour, weak ciphers |
-| **Privacy** | Spotlight telemetry, Siri analytics, Apple analytics, camera/mic access, location services |
-| **Persistence** | Launch agents, shell configs, kernel extensions |
-| **Logging** | Audit daemon, syslog, crash reporter, log retention |
-| **Credentials** | Exposed credential files, git config secrets, SSH key strength |
+| Category | macOS | Linux |
+|----------|-------|-------|
+| **Permissions** | Sudoers, world-writable files, SUID binaries | Sticky bit, cron perms, world-writable paths |
+| **System** | SIP, Gatekeeper, FileVault, XProtect, firmware, secure boot | AppArmor/SELinux, kernel modules, immutable files |
+| **Authentication** | Password policy, account lockout, empty passwords, Touch ID for sudo | PAM lockout, shadow passwords, root account lock |
+| **Network** | Open ports, SSH config, VPN, DNS-over-HTTPS, DNSSEC, weak ciphers | Firewall (ufw/firewalld/iptables), open ports, SSH hardening |
+| **Privacy** | Spotlight telemetry, Siri analytics, Apple analytics, location services | IP forwarding, protocol hardening |
+| **Persistence** | Launch agents, shell configs, kernel extensions | Systemd units in user dirs, authorized_keys perms |
+| **Logging** | Audit daemon, syslog forwarding, crash reporter, log retention | auditd, rsyslog/journald forwarding, log tamper protection |
+| **Credentials** | Exposed credential files, git config secrets, SSH key strength | Same |
+| **Boot** | Secure Boot (T2/Apple Silicon) | GRUB password, boot partition |
 
 ---
 
