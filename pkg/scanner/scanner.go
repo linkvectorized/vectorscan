@@ -39,8 +39,10 @@ func New() (*Scanner, error) {
 		pu = platform.NewMacOS()
 	case "linux":
 		pu = platform.NewLinux()
+	case "windows":
+		pu = platform.NewWindows()
 	default:
-		return nil, fmt.Errorf("unsupported platform: %s (macOS and Linux supported)", plat)
+		return nil, fmt.Errorf("unsupported platform: %s", plat)
 	}
 
 	hostname, _ := os.Hostname()
@@ -103,14 +105,17 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 
 		checkNum := 0
 		// 23 cross-platform base checks
-		// darwin: +39 macOS-specific = 62 total
-		// linux:  +25 Linux-specific = 48 total
+		// darwin:  +41 macOS-specific  = 64 total
+		// linux:   +25 Linux-specific  = 48 total
+		// windows: +32 Windows-specific = 55 total
 		totalChecks := 23
 		switch s.platform {
 		case "darwin":
 			totalChecks += 41
 		case "linux":
 			totalChecks += 25
+		case "windows":
+			totalChecks += 32
 		}
 
 		// Helper to report progress (respects context cancellation)
@@ -440,6 +445,148 @@ func (s *Scanner) Scan(ctx context.Context) (*models.Report, error) {
 			}
 			reportProgress("Remote management")
 			if f, err := s.checkRemoteManagement(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+		}
+
+		// ── Windows-specific checks (32) ──────────────────────────────────
+		if s.platform == "windows" {
+			reportProgress("Windows Defender")
+			if f, err := s.checkWindowsDefender(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("BitLocker encryption")
+			if f, err := s.checkBitLocker(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Windows Firewall")
+			if f, err := s.checkWindowsFirewall(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("User Account Control (UAC)")
+			if f, err := s.checkUAC(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Windows automatic updates")
+			if f, err := s.checkWindowsAutoUpdate(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Remote Desktop (RDP)")
+			if f, err := s.checkRDP(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("SMBv1 protocol")
+			if f, err := s.checkSMBv1(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Screen lock timeout")
+			if f, err := s.checkWindowsScreenLock(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Guest account")
+			if f, err := s.checkWindowsGuestAccount(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Built-in Administrator account")
+			if f, err := s.checkBuiltinAdminAccount(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("AutoRun policy")
+			if f, err := s.checkAutoRun(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Controlled Folder Access")
+			if f, err := s.checkControlledFolderAccess(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Secure Boot")
+			if f, err := s.checkWindowsSecureBoot(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Password policy")
+			if f, err := s.checkWindowsPasswordPolicy(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Security event log")
+			if f, err := s.checkWindowsEventLog(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Credential protection
+			reportProgress("LLMNR (name poisoning)")
+			if f, err := s.checkLLMNR(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("NetBIOS over TCP/IP")
+			if f, err := s.checkNetBIOS(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("WDigest cleartext credentials")
+			if f, err := s.checkWDigest(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("LSA Protection (RunAsPPL)")
+			if f, err := s.checkLSAProtection(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Credential Guard (VBS)")
+			if f, err := s.checkCredentialGuard(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Attack surface
+			reportProgress("Print Spooler (PrintNightmare)")
+			if f, err := s.checkPrintSpooler(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("AlwaysInstallElevated")
+			if f, err := s.checkAlwaysInstallElevated(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Unquoted service paths")
+			if f, err := s.checkUnquotedServicePaths(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("WinRM remote management")
+			if f, err := s.checkWinRM(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Logging & visibility
+			reportProgress("PowerShell ScriptBlock logging")
+			if f, err := s.checkPowerShellLogging(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Attack Surface Reduction rules")
+			if f, err := s.checkASRRules(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// System hardening
+			reportProgress("Spectre/Meltdown mitigations")
+			if f, err := s.checkSpectreMeltdown(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Telemetry level")
+			if f, err := s.checkTelemetryLevel(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+
+			// Persistence & network
+			reportProgress("Registry Run key persistence")
+			if f, err := s.checkRegistryRunKeys(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Scheduled tasks audit")
+			if f, err := s.checkScheduledTasks(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Network shares")
+			if f, err := s.checkNetworkShares(scanCtx); err == nil && f != nil {
+				findings <- *f
+			}
+			reportProgress("Null session restriction")
+			if f, err := s.checkNullSession(scanCtx); err == nil && f != nil {
 				findings <- *f
 			}
 		}

@@ -14,6 +14,12 @@ import (
 // userHomeDir returns the effective user's home directory, accounting for sudo.
 // When running under sudo, this returns the original user's home, not root's.
 func (s *Scanner) userHomeDir(ctx context.Context) string {
+	if s.platform == "windows" {
+		if h := os.Getenv("USERPROFILE"); h != "" {
+			return h
+		}
+		return os.Getenv("HOMEDRIVE") + os.Getenv("HOMEPATH")
+	}
 	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" && !strings.ContainsAny(sudoUser, " \t\n;|&$`\"'\\(){}[]") {
 		if h, err := s.platform_util.RunCommand(ctx, "sh", "-c", fmt.Sprintf("echo ~%s", sudoUser)); err == nil {
 			home := strings.TrimSpace(h)
@@ -2846,6 +2852,1146 @@ func (s *Scanner) checkLogTampering(ctx context.Context) (*models.Finding, error
 		Description: "System log files lack the append-only immutable flag. A compromised root account could erase evidence.",
 		Remediation: "Set append-only on log files: sudo chattr +a /var/log/auth.log /var/log/syslog  (note: this prevents log rotation — use selectively)",
 		Evidence:    []string{fmt.Sprintf("%d of %d log files lack append-only flag", checked-protected, checked)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// ── Windows-specific checks ────────────────────────────────────────────────
+
+// extractRegDwordValue parses the value field from a reg query output line.
+// Example: "    EnableLUA    REG_DWORD    0x1" → "0x1"
+func extractRegDwordValue(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "HKEY") {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) >= 3 {
+			return strings.ToLower(parts[len(parts)-1])
+		}
+	}
+	return ""
+}
+
+// checkWindowsDefender checks that Windows Defender real-time protection is enabled.
+func (s *Scanner) checkWindowsDefender(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"(Get-MpComputerStatus).RealTimeProtectionEnabled")
+	rtpOn := err == nil && strings.Contains(strings.ToLower(strings.TrimSpace(out)), "true")
+
+	if !rtpOn {
+		return &models.Finding{
+			ID:          "WIN-001",
+			Category:    "antivirus",
+			Severity:    models.SeverityCritical,
+			Title:       "Windows Defender real-time protection is disabled",
+			Description: "Real-time protection is not active. Malware can execute without any automated detection or blocking.",
+			Remediation: "Enable: Windows Security → Virus & threat protection → Real-time protection → On.",
+			Evidence:    []string{"Get-MpComputerStatus.RealTimeProtectionEnabled: false or unavailable"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("WIN-001-OK", "Windows Defender active ✓", "Real-time protection is enabled", "Malware protection running"), nil
+}
+
+// checkBitLocker checks that the C: drive is BitLocker encrypted.
+func (s *Scanner) checkBitLocker(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"try { (Get-BitLockerVolume -MountPoint 'C:').ProtectionStatus } catch { 'Unknown' }")
+	if err != nil {
+		return nil, nil
+	}
+	status := strings.ToLower(strings.TrimSpace(out))
+	if status == "on" || status == "1" {
+		return positiveAuditFinding("WIN-002-OK", "BitLocker encryption enabled ✓", "C: drive is BitLocker encrypted", "Data protected if device is lost or stolen"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-002",
+		Category:    "encryption",
+		Severity:    models.SeverityHigh,
+		Title:       "BitLocker disk encryption not enabled",
+		Description: "The C: drive is not BitLocker encrypted. If the device is lost or stolen, all data is readable without credentials.",
+		Remediation: "Enable BitLocker: Settings → Privacy & Security → Device encryption. Or: Control Panel → BitLocker Drive Encryption → Turn on BitLocker.",
+		Evidence:    []string{fmt.Sprintf("C: ProtectionStatus: %s", status)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkWindowsFirewall checks that Windows Firewall is enabled on all profiles.
+func (s *Scanner) checkWindowsFirewall(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"(Get-NetFirewallProfile | Where-Object {$_.Enabled -eq $false} | Select-Object -ExpandProperty Name) -join ','")
+	if err != nil {
+		// Fallback to netsh
+		netshOut, netshErr := s.platform_util.RunCommand(ctx, "netsh", "advfirewall", "show", "allprofiles", "state")
+		if netshErr != nil {
+			return nil, nil
+		}
+		if strings.Contains(strings.ToLower(netshOut), "off") {
+			return &models.Finding{
+				ID:          "WIN-003",
+				Category:    "network",
+				Severity:    models.SeverityHigh,
+				Title:       "Windows Firewall disabled on one or more profiles",
+				Description: "Windows Firewall is off on at least one network profile, allowing unrestricted inbound connections.",
+				Remediation: "Enable: Windows Security → Firewall & network protection → enable all profiles.",
+				Evidence:    []string{"netsh advfirewall: one or more profiles OFF"},
+				Timestamp:   time.Now(),
+			}, nil
+		}
+		return positiveAuditFinding("WIN-003-OK", "Windows Firewall enabled ✓", "All profiles enabled (via netsh)", "Inbound traffic filtered on all interfaces"), nil
+	}
+	disabled := strings.TrimSpace(out)
+	if disabled == "" {
+		return positiveAuditFinding("WIN-003-OK", "Windows Firewall enabled ✓", "Domain, Private, and Public profiles all enabled", "Inbound traffic filtered on all interfaces"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-003",
+		Category:    "network",
+		Severity:    models.SeverityHigh,
+		Title:       "Windows Firewall disabled on some profiles",
+		Description: fmt.Sprintf("Windows Firewall is off on: %s. This allows unrestricted inbound network connections on those profiles.", disabled),
+		Remediation: "Enable all profiles: Windows Security → Firewall & network protection → turn on for each profile.",
+		Evidence:    []string{fmt.Sprintf("Disabled profiles: %s", disabled)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkUAC checks that User Account Control is enabled.
+func (s *Scanner) checkUAC(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`, "/v", "EnableLUA")
+	if err != nil {
+		return nil, nil
+	}
+	val := extractRegDwordValue(out)
+	if val == "0x1" || val == "1" {
+		return positiveAuditFinding("WIN-004-OK", "UAC enabled ✓", "User Account Control is active", "Privilege elevation requires user consent"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-004",
+		Category:    "authentication",
+		Severity:    models.SeverityHigh,
+		Title:       "User Account Control (UAC) is disabled",
+		Description: "UAC is disabled. Any program can silently request administrator privileges without user consent, making malware escalation trivial.",
+		Remediation: "Enable UAC: Control Panel → User Accounts → Change User Account Control settings → set at least 'Notify me only when apps try to make changes'.",
+		Evidence:    []string{fmt.Sprintf("EnableLUA = %s", val)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkWindowsAutoUpdate checks that automatic Windows updates are configured.
+func (s *Scanner) checkWindowsAutoUpdate(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update`, "/v", "AUOptions")
+	if err != nil {
+		// Key absent usually means Windows Update Service manages it (Windows 10/11 default)
+		return positiveAuditFinding("WIN-005-OK", "Windows Update managed automatically ✓", "AUOptions not set — Windows Update Service controls updates", "Updates managed by OS default policy"), nil
+	}
+	val := extractRegDwordValue(out)
+	// 4 = auto download+install, 3 = auto download+notify, 2 = notify only, 1 = disabled
+	if val == "0x4" || val == "4" || val == "0x3" || val == "3" {
+		return positiveAuditFinding("WIN-005-OK", "Windows automatic updates enabled ✓", fmt.Sprintf("AUOptions = %s (auto download)", val), "Security patches applied automatically"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-005",
+		Category:    "updates",
+		Severity:    models.SeverityMedium,
+		Title:       "Windows automatic updates not set to auto-install",
+		Description: "Automatic updates are configured for notify-only or disabled. Security patches may be delayed indefinitely.",
+		Remediation: "Enable automatic updates: Settings → Windows Update → Advanced options → set to automatic.",
+		Evidence:    []string{fmt.Sprintf("AUOptions = %s (1=off, 2=notify, 3=dl+notify, 4=dl+install)", val)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkRDP checks Remote Desktop status and whether NLA is required.
+func (s *Scanner) checkRDP(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server`, "/v", "fDenyTSConnections")
+	if err != nil {
+		return nil, nil // Cannot determine RDP status
+	}
+	rdpVal := extractRegDwordValue(out)
+	if rdpVal == "0x1" || rdpVal == "1" {
+		return positiveAuditFinding("WIN-006-OK", "Remote Desktop disabled ✓", "fDenyTSConnections = 1", "RDP attack surface eliminated"), nil
+	}
+	// RDP is enabled — check NLA
+	nlaOut, nlaErr := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp`, "/v", "UserAuthentication")
+	nlaVal := extractRegDwordValue(nlaOut)
+	nlaEnabled := nlaErr == nil && (nlaVal == "0x1" || nlaVal == "1")
+	if nlaEnabled {
+		return &models.Finding{
+			ID:          "WIN-006",
+			Category:    "network",
+			Severity:    models.SeverityMedium,
+			Title:       "Remote Desktop enabled (NLA enforced)",
+			Description: "RDP is active with Network Level Authentication required. Increases attack surface but is protected by credential pre-auth.",
+			Remediation: "Disable RDP if not required. If needed, restrict to specific IPs in Windows Firewall and use a VPN.",
+			Evidence:    []string{"fDenyTSConnections = 0 (RDP on)", "UserAuthentication = 1 (NLA required)"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return &models.Finding{
+		ID:          "WIN-006",
+		Category:    "network",
+		Severity:    models.SeverityHigh,
+		Title:       "Remote Desktop enabled without Network Level Authentication",
+		Description: "RDP is active and the login screen is exposed to the network without pre-authentication. Vulnerable to credential brute-force and BlueKeep-style vulnerabilities.",
+		Remediation: "Enable NLA: System Properties → Remote → 'Allow connections only from computers running Remote Desktop with NLA'. Or disable RDP entirely.",
+		Evidence:    []string{"fDenyTSConnections = 0 (RDP on)", "UserAuthentication = 0 (NLA off)"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkSMBv1 checks whether the legacy SMBv1 protocol is enabled (EternalBlue / WannaCry vector).
+func (s *Scanner) checkSMBv1(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"try { (Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol).State } catch { (Get-SmbServerConfiguration).EnableSMB1Protocol }")
+	state := strings.ToLower(strings.TrimSpace(out))
+	if err != nil || state == "" {
+		// Registry fallback
+		regOut, regErr := s.platform_util.RunCommand(ctx, "reg", "query",
+			`HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters`, "/v", "SMB1")
+		if regErr != nil {
+			// Cannot determine — assume disabled if feature query AND registry both fail
+			return positiveAuditFinding("WIN-007-OK", "SMBv1 disabled ✓", "SMBv1 not detected via registry or PowerShell", "EternalBlue/WannaCry vector likely eliminated"), nil
+		}
+		regVal := extractRegDwordValue(regOut)
+		if regVal == "0x0" || regVal == "0" || regVal == "" {
+			return positiveAuditFinding("WIN-007-OK", "SMBv1 disabled ✓", "SMBv1 = 0 in registry", "EternalBlue/WannaCry vector eliminated"), nil
+		}
+		// Registry confirms SMBv1 is enabled
+		return &models.Finding{
+			ID:          "WIN-007",
+			Category:    "network",
+			Severity:    models.SeverityCritical,
+			Title:       "SMBv1 protocol is enabled",
+			Description: "SMBv1 is a deprecated protocol exploited by EternalBlue (MS17-010), which powered WannaCry and NotPetya ransomware. It should never be enabled on modern systems.",
+			Remediation: "Disable: powershell -Command 'Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol' (requires reboot).",
+			Evidence:    []string{fmt.Sprintf("Registry SMB1 = %s (enabled)", regVal)},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	if state == "disabled" || state == "false" || state == "0" {
+		return positiveAuditFinding("WIN-007-OK", "SMBv1 disabled ✓", "SMBv1 protocol is disabled", "EternalBlue/WannaCry attack surface eliminated"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-007",
+		Category:    "network",
+		Severity:    models.SeverityCritical,
+		Title:       "SMBv1 protocol is enabled",
+		Description: "SMBv1 is a deprecated protocol exploited by EternalBlue (MS17-010), which powered WannaCry and NotPetya ransomware. It should never be enabled on modern systems.",
+		Remediation: "Disable: powershell -Command 'Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol' (requires reboot).",
+		Evidence:    []string{fmt.Sprintf("SMBv1 state: %s (enabled)", state)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkWindowsScreenLock checks that the screen saver locks after ≤10 minutes.
+func (s *Scanner) checkWindowsScreenLock(ctx context.Context) (*models.Finding, error) {
+	timeoutOut, _ := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKCU\Control Panel\Desktop`, "/v", "ScreenSaveTimeOut")
+	secureOut, _ := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKCU\Control Panel\Desktop`, "/v", "ScreenSaverIsSecure")
+
+	// ScreenSaveTimeOut and ScreenSaverIsSecure are REG_SZ — parse last field from reg output
+	secureVal := ""
+	for _, line := range strings.Split(secureOut, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "HKEY") {
+			parts := strings.Fields(line)
+			if len(parts) >= 3 {
+				secureVal = parts[len(parts)-1]
+			}
+		}
+	}
+
+	timeoutSeconds := 0
+	for _, line := range strings.Split(timeoutOut, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "ScreenSaveTimeOut") {
+			parts := strings.Fields(line)
+			if len(parts) >= 3 {
+				n, err := strconv.Atoi(parts[len(parts)-1])
+				if err == nil {
+					timeoutSeconds = n
+				}
+			}
+		}
+	}
+
+	if timeoutSeconds == 0 || timeoutSeconds > 600 {
+		return &models.Finding{
+			ID:          "WIN-008",
+			Category:    "authentication",
+			Severity:    models.SeverityMedium,
+			Title:       "Screen lock not configured or timeout too long",
+			Description: "Screen lock is not set, or the timeout exceeds 10 minutes. An unattended machine can be accessed without credentials.",
+			Remediation: "Set screen lock: Settings → Personalization → Lock screen → Screen saver settings → set timeout ≤ 5 min and enable 'On resume, display logon screen'.",
+			Evidence:    []string{fmt.Sprintf("ScreenSaveTimeOut: %d seconds", timeoutSeconds), fmt.Sprintf("ScreenSaverIsSecure: %s", secureVal)},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	if secureVal != "1" {
+		return &models.Finding{
+			ID:          "WIN-008",
+			Category:    "authentication",
+			Severity:    models.SeverityMedium,
+			Title:       "Screen saver does not require password on resume",
+			Description: "Screen saver activates but does not require a password, leaving the machine accessible when unattended.",
+			Remediation: "Enable: Screen saver settings → check 'On resume, display logon screen'.",
+			Evidence:    []string{fmt.Sprintf("ScreenSaverIsSecure: %s (expected 1)", secureVal)},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("WIN-008-OK", "Screen lock configured ✓",
+		fmt.Sprintf("Locks after %d seconds with password required", timeoutSeconds), "Unattended access protected"), nil
+}
+
+// checkWindowsGuestAccount checks that the built-in Guest account is disabled.
+func (s *Scanner) checkWindowsGuestAccount(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"try { (Get-LocalUser -Name 'Guest').Enabled } catch { 'error' }")
+	if err != nil || strings.TrimSpace(out) == "error" {
+		// Fallback to net user
+		netOut, netErr := s.platform_util.RunCommand(ctx, "net", "user", "guest")
+		if netErr != nil {
+			return nil, nil
+		}
+		for _, line := range strings.Split(netOut, "\n") {
+			if strings.Contains(strings.ToLower(line), "account active") {
+				if strings.Contains(strings.ToLower(line), "no") {
+					return positiveAuditFinding("WIN-009-OK", "Guest account disabled ✓", "Guest account is inactive", "Unauthorized access prevented"), nil
+				}
+				break
+			}
+		}
+		return &models.Finding{
+			ID:          "WIN-009",
+			Category:    "authentication",
+			Severity:    models.SeverityMedium,
+			Title:       "Guest account is enabled",
+			Description: "The Windows Guest account is active. It allows limited unauthenticated access and can serve as an initial foothold.",
+			Remediation: "Disable: net user guest /active:no  or  Settings → Accounts → Other users.",
+			Evidence:    []string{"Guest account: Active"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(out)), "false") {
+		return positiveAuditFinding("WIN-009-OK", "Guest account disabled ✓", "Guest account is disabled", "Unauthorized access prevented"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-009",
+		Category:    "authentication",
+		Severity:    models.SeverityMedium,
+		Title:       "Guest account is enabled",
+		Description: "The Windows Guest account is active. It allows limited unauthenticated access and can serve as an initial foothold.",
+		Remediation: "Disable: net user guest /active:no  or  Settings → Accounts → Other users.",
+		Evidence:    []string{"Guest account: Enabled"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkBuiltinAdminAccount checks that the default 'Administrator' account is disabled or renamed.
+func (s *Scanner) checkBuiltinAdminAccount(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"try { (Get-LocalUser -Name 'Administrator').Enabled } catch { 'error' }")
+	if err != nil || strings.TrimSpace(out) == "error" {
+		return nil, nil
+	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(out)), "false") {
+		return positiveAuditFinding("WIN-010-OK", "Built-in Administrator disabled ✓", "Default Administrator account is inactive", "Default credential attacks prevented"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-010",
+		Category:    "authentication",
+		Severity:    models.SeverityMedium,
+		Title:       "Built-in Administrator account is enabled",
+		Description: "The default 'Administrator' account is active. Attackers specifically target this well-known account name in credential attacks.",
+		Remediation: "Disable or rename: Computer Management → Local Users and Groups → Users → Administrator → Disable. Or: net user administrator /active:no",
+		Evidence:    []string{"Administrator account: Enabled"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkAutoRun checks that AutoRun is disabled for removable media.
+func (s *Scanner) checkAutoRun(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer`, "/v", "NoDriveTypeAutoRun")
+	if err != nil {
+		out2, err2 := s.platform_util.RunCommand(ctx, "reg", "query",
+			`HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer`, "/v", "NoDriveTypeAutoRun")
+		if err2 != nil {
+			return &models.Finding{
+				ID:          "WIN-011",
+				Category:    "system",
+				Severity:    models.SeverityMedium,
+				Title:       "AutoRun policy not configured",
+				Description: "AutoRun is not explicitly disabled. Malicious USB drives or optical discs could execute code automatically when inserted.",
+				Remediation: "Disable via Group Policy: Computer Configuration → Administrative Templates → Windows Components → AutoPlay Policies → Disable AutoPlay. Or set NoDriveTypeAutoRun = 0xFF in HKLM Policies Explorer.",
+				Evidence:    []string{"NoDriveTypeAutoRun not set in HKLM or HKCU"},
+				Timestamp:   time.Now(),
+			}, nil
+		}
+		out = out2
+	}
+	val := extractRegDwordValue(out)
+	// 0xff = all drives disabled, 0x91 = removable + network, any high value = good
+	if val == "0xff" || val == "255" || val == "0x91" || val == "145" {
+		return positiveAuditFinding("WIN-011-OK", "AutoRun disabled ✓", fmt.Sprintf("NoDriveTypeAutoRun = %s", val), "USB/disc autorun attacks prevented"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-011",
+		Category:    "system",
+		Severity:    models.SeverityMedium,
+		Title:       "AutoRun not fully disabled",
+		Description: fmt.Sprintf("AutoRun policy value %s may allow some drive types to execute automatically. Malicious USB devices could run code on insertion.", val),
+		Remediation: "Set NoDriveTypeAutoRun = 0xFF via Group Policy or: reg add HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer /v NoDriveTypeAutoRun /t REG_DWORD /d 255 /f",
+		Evidence:    []string{fmt.Sprintf("NoDriveTypeAutoRun = %s", val)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkControlledFolderAccess checks that ransomware protection (Controlled Folder Access) is on.
+func (s *Scanner) checkControlledFolderAccess(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"(Get-MpPreference).EnableControlledFolderAccess")
+	if err != nil {
+		return nil, nil
+	}
+	val := strings.TrimSpace(out)
+	if val == "1" || strings.ToLower(val) == "enabled" {
+		return positiveAuditFinding("WIN-012-OK", "Controlled Folder Access enabled ✓", "Ransomware protection is active", "Unauthorized writes to protected folders blocked"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-012",
+		Category:    "antivirus",
+		Severity:    models.SeverityMedium,
+		Title:       "Controlled Folder Access (ransomware protection) disabled",
+		Description: "Ransomware protection is off. Malicious software can freely encrypt files in Documents, Desktop, and Pictures without any blocking.",
+		Remediation: "Enable: Windows Security → Virus & threat protection → Ransomware protection → Controlled folder access → On.",
+		Evidence:    []string{fmt.Sprintf("EnableControlledFolderAccess: %s (0=off, 1=on, 2=audit)", val)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkWindowsSecureBoot checks that UEFI Secure Boot is enabled.
+func (s *Scanner) checkWindowsSecureBoot(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"try { Confirm-SecureBootUEFI } catch { 'NotSupported' }")
+	result := strings.ToLower(strings.TrimSpace(out))
+	if err == nil && result == "true" {
+		return positiveAuditFinding("WIN-013-OK", "Secure Boot enabled ✓", "UEFI Secure Boot is active", "Unsigned bootloaders blocked at startup"), nil
+	}
+	if result == "false" {
+		return &models.Finding{
+			ID:          "WIN-013",
+			Category:    "system",
+			Severity:    models.SeverityHigh,
+			Title:       "Secure Boot is disabled",
+			Description: "Secure Boot is not enabled. An attacker with physical access can boot unsigned code, bypassing all OS-level security controls.",
+			Remediation: "Enable Secure Boot in UEFI/BIOS firmware settings (typically F2, Del, or F12 at boot). Ensure boot mode is UEFI, not Legacy.",
+			Evidence:    []string{"Confirm-SecureBootUEFI returned False"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	// NotSupported or error — try registry
+	regOut, regErr := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State`, "/v", "UEFISecureBootEnabled")
+	if regErr == nil && extractRegDwordValue(regOut) == "0x1" {
+		return positiveAuditFinding("WIN-013-OK", "Secure Boot enabled ✓", "UEFISecureBootEnabled = 1 (registry)", "Bootloader integrity verified"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-013",
+		Category:    "system",
+		Severity:    models.SeverityMedium,
+		Title:       "Secure Boot status unknown (possible legacy BIOS)",
+		Description: "Secure Boot status cannot be confirmed. Legacy BIOS systems lack Secure Boot, allowing unsigned bootloaders.",
+		Remediation: "Check Secure Boot status in UEFI firmware settings. Modern systems should boot in UEFI mode with Secure Boot enabled.",
+		Evidence:    []string{"Confirm-SecureBootUEFI not available or inconclusive"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkWindowsPasswordPolicy checks local account password policy via 'net accounts'.
+func (s *Scanner) checkWindowsPasswordPolicy(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "net", "accounts")
+	if err != nil {
+		return nil, nil
+	}
+	var issues []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, "Minimum password length") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				lenStr := strings.TrimSpace(parts[1])
+				if lenStr == "0" || strings.ToLower(lenStr) == "none" {
+					issues = append(issues, "No minimum password length enforced")
+				} else {
+					n, err := strconv.Atoi(lenStr)
+					if err == nil && n < 8 {
+						issues = append(issues, fmt.Sprintf("Minimum password length too short: %d chars (recommend 12+)", n))
+					}
+				}
+			}
+		}
+		if strings.Contains(line, "Maximum password age") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				ageStr := strings.TrimSpace(parts[1])
+				if strings.ToLower(ageStr) == "unlimited" {
+					issues = append(issues, "Passwords never expire")
+				}
+			}
+		}
+	}
+	if len(issues) == 0 {
+		return positiveAuditFinding("WIN-014-OK", "Password policy configured ✓", "Minimum length and expiry are set", "Weak password risk mitigated"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-014",
+		Category:    "authentication",
+		Severity:    models.SeverityMedium,
+		Title:       "Weak local password policy",
+		Description: "Local account password policy does not enforce adequate length or expiration.",
+		Remediation: "Configure: Local Security Policy → Account Policies → Password Policy. Set minimum length ≥ 12, enable complexity, set max age ≤ 90 days.",
+		Evidence:    issues,
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkWindowsEventLog checks that the Security event log has an adequate retention size.
+func (s *Scanner) checkWindowsEventLog(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"(Get-WinEvent -ListLog Security).MaximumSizeInBytes")
+	if err != nil {
+		// Fallback to wevtutil
+		wOut, wErr := s.platform_util.RunCommand(ctx, "wevtutil", "gl", "Security")
+		if wErr != nil {
+			return nil, nil
+		}
+		for _, line := range strings.Split(wOut, "\n") {
+			if strings.Contains(line, "maxSize:") {
+				parts := strings.SplitN(line, ":", 2)
+				if len(parts) == 2 {
+					n, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64)
+					if err == nil {
+						sizeKB := n / 1024
+						if sizeKB < 20480 {
+							return &models.Finding{
+								ID:          "WIN-015",
+								Category:    "audit",
+								Severity:    models.SeverityLow,
+								Title:       "Security event log size too small",
+								Description: fmt.Sprintf("Security log max size is %d KB. Events will be overwritten too quickly, hindering incident investigation.", sizeKB),
+								Remediation: "Increase log size: Event Viewer → Windows Logs → Security → Properties → set max size to ≥ 102400 KB (100 MB).",
+								Evidence:    []string{fmt.Sprintf("Security log maxSize: %d KB", sizeKB)},
+								Timestamp:   time.Now(),
+							}, nil
+						}
+					}
+				}
+			}
+		}
+		return positiveAuditFinding("WIN-015-OK", "Security event log configured ✓", "Security log size is adequate", "Audit trail retained for investigation"), nil
+	}
+	sizeBytes, convErr := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if convErr != nil {
+		return nil, nil
+	}
+	sizeKB := sizeBytes / 1024
+	if sizeKB < 20480 {
+		return &models.Finding{
+			ID:          "WIN-015",
+			Category:    "audit",
+			Severity:    models.SeverityLow,
+			Title:       "Security event log size too small",
+			Description: fmt.Sprintf("Security log max size is %d KB. Rapid event overwrites limit how far back an investigation can reach.", sizeKB),
+			Remediation: "Increase: Event Viewer → Windows Logs → Security → Properties → set max log size ≥ 102400 KB (100 MB).",
+			Evidence:    []string{fmt.Sprintf("MaximumSizeInBytes: %d (%d KB)", sizeBytes, sizeKB)},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("WIN-015-OK", "Security event log configured ✓",
+		fmt.Sprintf("Security log max size: %d KB", sizeKB), "Adequate audit trail retention"), nil
+}
+
+// checkLLMNR checks if Link-Local Multicast Name Resolution is disabled.
+// LLMNR is the #1 internal pentest vector — Responder captures NTLMv2 hashes in minutes.
+func (s *Scanner) checkLLMNR(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient`, "/v", "EnableMulticast")
+	if err != nil {
+		// Key doesn't exist = LLMNR is enabled (default)
+		return &models.Finding{
+			ID:          "WIN-016",
+			Category:    "network",
+			Severity:    models.SeverityCritical,
+			Title:       "LLMNR is enabled (credential theft vector)",
+			Description: "Link-Local Multicast Name Resolution is active. An attacker on the same network can poison LLMNR responses with Responder and capture NTLMv2 password hashes within minutes — no user interaction required.",
+			Remediation: "Disable via Group Policy: Computer Configuration → Administrative Templates → Network → DNS Client → Turn off multicast name resolution → Enabled. Or: reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient\" /v EnableMulticast /t REG_DWORD /d 0 /f",
+			Evidence:    []string{"EnableMulticast registry key not set (default: enabled)"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	val := extractRegDwordValue(out)
+	if val == "0x0" || val == "0" {
+		return positiveAuditFinding("WIN-016-OK", "LLMNR disabled ✓", "EnableMulticast = 0", "LLMNR/Responder poisoning attack prevented"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-016",
+		Category:    "network",
+		Severity:    models.SeverityCritical,
+		Title:       "LLMNR is enabled (credential theft vector)",
+		Description: "LLMNR is active. Attackers use tools like Responder to answer LLMNR queries and capture NTLMv2 hashes for offline cracking.",
+		Remediation: "Disable: reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient\" /v EnableMulticast /t REG_DWORD /d 0 /f",
+		Evidence:    []string{fmt.Sprintf("EnableMulticast = %s (should be 0)", val)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkNetBIOS checks if NetBIOS over TCP/IP is disabled.
+// NetBIOS enables NBNS poisoning — same class of attack as LLMNR.
+func (s *Scanner) checkNetBIOS(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"(Get-WmiObject Win32_NetworkAdapterConfiguration -Filter 'IPEnabled=True').TcpipNetbiosOptions")
+	if err != nil {
+		return nil, nil
+	}
+	// TcpipNetbiosOptions: 0=default(DHCP), 1=enabled, 2=disabled
+	// Multi-adapter: each adapter returns a value; ALL must be 2 for full protection
+	result := strings.TrimSpace(out)
+	allDisabled := true
+	hasAdapter := false
+	for _, line := range strings.Split(result, "\n") {
+		val := strings.TrimSpace(line)
+		if val == "" {
+			continue
+		}
+		hasAdapter = true
+		if val != "2" {
+			allDisabled = false
+		}
+	}
+	if !hasAdapter {
+		return nil, nil
+	}
+	if allDisabled {
+		return positiveAuditFinding("WIN-017-OK", "NetBIOS over TCP/IP disabled ✓", "All adapters: TcpipNetbiosOptions = 2", "NBNS poisoning attack prevented"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-017",
+		Category:    "network",
+		Severity:    models.SeverityHigh,
+		Title:       "NetBIOS over TCP/IP is enabled",
+		Description: "NetBIOS name service is active on one or more adapters. Like LLMNR, this allows attackers to poison name resolution and capture credentials using tools like Responder.",
+		Remediation: "Disable per-adapter: Network Adapter Properties → IPv4 → Advanced → WINS → Disable NetBIOS over TCP/IP. Or via DHCP option 001 = 0x2.",
+		Evidence:    []string{fmt.Sprintf("TcpipNetbiosOptions values: %s (all must be 2)", result)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkWDigest checks if WDigest cleartext credential caching is disabled.
+// With WDigest enabled, plaintext passwords are stored in LSASS memory — trivial for mimikatz.
+func (s *Scanner) checkWDigest(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest`, "/v", "UseLogonCredential")
+	if err != nil {
+		// Key absent: on Win 8.1+/Server 2012 R2+ WDigest is disabled by default (KB2871997).
+		// But absence doesn't guarantee it — explicit 0 is safer.
+		return positiveAuditFinding("WIN-018-OK", "WDigest cleartext caching likely disabled ✓",
+			"UseLogonCredential not set (default disabled on Win 8.1+)",
+			"Plaintext credentials not cached in LSASS"), nil
+	}
+	val := extractRegDwordValue(out)
+	if val == "0x0" || val == "0" {
+		return positiveAuditFinding("WIN-018-OK", "WDigest cleartext caching disabled ✓", "UseLogonCredential = 0", "Mimikatz cannot extract plaintext passwords from memory"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-018",
+		Category:    "authentication",
+		Severity:    models.SeverityCritical,
+		Title:       "WDigest stores cleartext passwords in memory",
+		Description: "WDigest authentication is enabled (UseLogonCredential=1). Plaintext passwords are stored in LSASS memory and can be extracted by mimikatz or similar tools with a single command.",
+		Remediation: "Disable immediately: reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\SecurityProviders\\WDigest /v UseLogonCredential /t REG_DWORD /d 0 /f",
+		Evidence:    []string{fmt.Sprintf("UseLogonCredential = %s (CRITICAL: cleartext passwords in memory)", val)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkLSAProtection checks if LSA is running as a Protected Process Light (PPL).
+// Without RunAsPPL, tools like mimikatz can freely dump LSASS credentials.
+func (s *Scanner) checkLSAProtection(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SYSTEM\CurrentControlSet\Control\Lsa`, "/v", "RunAsPPL")
+	if err != nil {
+		return &models.Finding{
+			ID:          "WIN-019",
+			Category:    "authentication",
+			Severity:    models.SeverityHigh,
+			Title:       "LSA Protection (RunAsPPL) not enabled",
+			Description: "LSASS is not running as a Protected Process. Credential dumping tools (mimikatz, procdump) can attach to LSASS and extract all cached credentials.",
+			Remediation: "Enable: reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa /v RunAsPPL /t REG_DWORD /d 1 /f (requires reboot).",
+			Evidence:    []string{"RunAsPPL registry key not present"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	val := extractRegDwordValue(out)
+	if val == "0x1" || val == "1" || val == "0x2" || val == "2" {
+		return positiveAuditFinding("WIN-019-OK", "LSA Protection enabled ✓", fmt.Sprintf("RunAsPPL = %s", val), "LSASS protected from credential dumping tools"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-019",
+		Category:    "authentication",
+		Severity:    models.SeverityHigh,
+		Title:       "LSA Protection (RunAsPPL) not enabled",
+		Description: "RunAsPPL is set to 0. Credential dumping tools can freely extract passwords from LSASS memory.",
+		Remediation: "Enable: reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa /v RunAsPPL /t REG_DWORD /d 1 /f (requires reboot).",
+		Evidence:    []string{fmt.Sprintf("RunAsPPL = %s (should be 1 or 2)", val)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkCredentialGuard checks if Credential Guard (VBS) is enabled.
+// Hardware-isolated credential storage that stops pass-the-hash attacks.
+func (s *Scanner) checkCredentialGuard(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard`, "/v", "EnableVirtualizationBasedSecurity")
+	if err != nil {
+		return &models.Finding{
+			ID:          "WIN-020",
+			Category:    "authentication",
+			Severity:    models.SeverityMedium,
+			Title:       "Credential Guard not configured",
+			Description: "Virtualization Based Security (VBS) is not configured. Credential Guard uses hardware isolation to protect domain credentials from pass-the-hash attacks.",
+			Remediation: "Enable via Group Policy: Computer Configuration → Administrative Templates → System → Device Guard → Turn on Virtualization Based Security. Requires compatible hardware (UEFI, TPM 2.0, 64-bit).",
+			Evidence:    []string{"EnableVirtualizationBasedSecurity key not present"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	val := extractRegDwordValue(out)
+	if val == "0x1" || val == "1" {
+		// Also check LsaCfgFlags for Credential Guard specifically
+		lsaOut, _ := s.platform_util.RunCommand(ctx, "reg", "query",
+			`HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard`, "/v", "LsaCfgFlags")
+		lsaVal := extractRegDwordValue(lsaOut)
+		if lsaVal == "0x1" || lsaVal == "1" || lsaVal == "0x2" || lsaVal == "2" {
+			return positiveAuditFinding("WIN-020-OK", "Credential Guard enabled ✓", "VBS + LsaCfgFlags active", "Domain credentials hardware-isolated from theft"), nil
+		}
+		return positiveAuditFinding("WIN-020-OK", "VBS enabled (Credential Guard may be active) ✓", fmt.Sprintf("EnableVirtualizationBasedSecurity = %s", val), "Virtualization Based Security active"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-020",
+		Category:    "authentication",
+		Severity:    models.SeverityMedium,
+		Title:       "Credential Guard / VBS not enabled",
+		Description: "Virtualization Based Security is disabled. Without Credential Guard, domain credentials in memory are vulnerable to pass-the-hash and credential relay attacks.",
+		Remediation: "Enable via Group Policy or: reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\DeviceGuard /v EnableVirtualizationBasedSecurity /t REG_DWORD /d 1 /f",
+		Evidence:    []string{fmt.Sprintf("EnableVirtualizationBasedSecurity = %s (should be 1)", val)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkPrintSpooler checks if the Print Spooler service is running (PrintNightmare vector).
+func (s *Scanner) checkPrintSpooler(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "sc", "query", "Spooler")
+	if err != nil || !strings.Contains(strings.ToUpper(out), "RUNNING") {
+		return positiveAuditFinding("WIN-021-OK", "Print Spooler not running ✓", "Spooler service is stopped", "PrintNightmare (CVE-2021-34527) attack surface eliminated"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-021",
+		Category:    "system",
+		Severity:    models.SeverityHigh,
+		Title:       "Print Spooler service is running (PrintNightmare)",
+		Description: "The Print Spooler service is active. It has been exploited by PrintNightmare (CVE-2021-34527) for remote code execution as SYSTEM. Unless printing is required, it should be disabled.",
+		Remediation: "Disable if printing not needed: sc config Spooler start=disabled && sc stop Spooler. If needed, ensure KB5005010+ is installed.",
+		Evidence:    []string{"Spooler service: RUNNING"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkAlwaysInstallElevated checks if MSI packages always install with SYSTEM privileges.
+// If set in both HKLM and HKCU, any user can install a malicious MSI as SYSTEM — instant privesc.
+func (s *Scanner) checkAlwaysInstallElevated(ctx context.Context) (*models.Finding, error) {
+	hklmOut, hklmErr := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SOFTWARE\Policies\Microsoft\Windows\Installer`, "/v", "AlwaysInstallElevated")
+	hkcuOut, hkcuErr := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKCU\SOFTWARE\Policies\Microsoft\Windows\Installer`, "/v", "AlwaysInstallElevated")
+
+	hklmSet := hklmErr == nil && (extractRegDwordValue(hklmOut) == "0x1" || extractRegDwordValue(hklmOut) == "1")
+	hkcuSet := hkcuErr == nil && (extractRegDwordValue(hkcuOut) == "0x1" || extractRegDwordValue(hkcuOut) == "1")
+
+	if hklmSet && hkcuSet {
+		return &models.Finding{
+			ID:          "WIN-022",
+			Category:    "permissions",
+			Severity:    models.SeverityCritical,
+			Title:       "AlwaysInstallElevated — any user can get SYSTEM",
+			Description: "AlwaysInstallElevated is set in both HKLM and HKCU. ANY user can craft a malicious .msi file and it will execute as NT AUTHORITY\\SYSTEM. This is a trivial privilege escalation (msfvenom -p windows/x64/shell_reverse_tcp ... -f msi).",
+			Remediation: "Remove immediately: reg delete HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated /f && reg delete HKCU\\SOFTWARE\\Policies\\Microsoft\\Windows\\Installer /v AlwaysInstallElevated /f",
+			Evidence:    []string{"HKLM AlwaysInstallElevated = 1", "HKCU AlwaysInstallElevated = 1"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("WIN-022-OK", "AlwaysInstallElevated not set ✓", "MSI packages install with user privileges only", "MSI privilege escalation path closed"), nil
+}
+
+// checkUnquotedServicePaths finds services with unquoted paths containing spaces.
+// Classic privilege escalation: place a binary at the split point (e.g., C:\Program.exe).
+func (s *Scanner) checkUnquotedServicePaths(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		`Get-WmiObject Win32_Service | Where-Object { $_.PathName -notlike '"*' -and $_.PathName -notlike '\??\*' -and $_.PathName -like '* *' -and $_.PathName -notlike 'C:\Windows\*' } | Select-Object -ExpandProperty PathName`)
+	if err != nil {
+		return nil, nil
+	}
+	paths := strings.TrimSpace(out)
+	if paths == "" {
+		return positiveAuditFinding("WIN-023-OK", "No unquoted service paths ✓", "All service paths are properly quoted", "Service path hijacking prevented"), nil
+	}
+	lines := strings.Split(paths, "\n")
+	var evidence []string
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l != "" {
+			evidence = append(evidence, l)
+		}
+	}
+	if len(evidence) == 0 {
+		return positiveAuditFinding("WIN-023-OK", "No unquoted service paths ✓", "All service paths are properly quoted", "Service path hijacking prevented"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-023",
+		Category:    "permissions",
+		Severity:    models.SeverityHigh,
+		Title:       fmt.Sprintf("Unquoted service paths found (%d services)", len(evidence)),
+		Description: "Services have executable paths containing spaces that are not quoted. An attacker can place a binary at the path split point to hijack the service and escalate to SYSTEM.",
+		Remediation: "Quote each service path: sc config <ServiceName> binPath= \"\\\"C:\\path with spaces\\service.exe\\\"\"",
+		Evidence:    evidence,
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkWinRM checks if Windows Remote Management service is running.
+func (s *Scanner) checkWinRM(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "sc", "query", "WinRM")
+	if err != nil || !strings.Contains(strings.ToUpper(out), "RUNNING") {
+		return positiveAuditFinding("WIN-024-OK", "WinRM not running ✓", "Windows Remote Management service is stopped", "Remote command execution surface closed"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-024",
+		Category:    "network",
+		Severity:    models.SeverityHigh,
+		Title:       "WinRM (Windows Remote Management) is enabled",
+		Description: "WinRM allows remote command execution via PowerShell. If an attacker obtains credentials (via LLMNR/NTLM relay), WinRM provides full remote shell access.",
+		Remediation: "Disable if not needed: sc config WinRM start=disabled && sc stop WinRM. If required, restrict to specific IPs via Windows Firewall and require HTTPS.",
+		Evidence:    []string{"WinRM service: RUNNING"},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkPowerShellLogging checks if PowerShell ScriptBlock logging is enabled.
+// Without logging, attacker activity via PowerShell is completely invisible.
+func (s *Scanner) checkPowerShellLogging(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging`, "/v", "EnableScriptBlockLogging")
+	if err != nil {
+		return &models.Finding{
+			ID:          "WIN-025",
+			Category:    "audit",
+			Severity:    models.SeverityMedium,
+			Title:       "PowerShell ScriptBlock logging not enabled",
+			Description: "PowerShell command logging is not configured. Attackers heavily abuse PowerShell for post-exploitation — without logging, their activity leaves no trace in event logs.",
+			Remediation: "Enable via Group Policy: Computer Configuration → Administrative Templates → Windows Components → PowerShell → Turn on Script Block Logging. Or: reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging\" /v EnableScriptBlockLogging /t REG_DWORD /d 1 /f",
+			Evidence:    []string{"ScriptBlockLogging registry key not configured"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	val := extractRegDwordValue(out)
+	if val == "0x1" || val == "1" {
+		return positiveAuditFinding("WIN-025-OK", "PowerShell ScriptBlock logging enabled ✓", "EnableScriptBlockLogging = 1", "PowerShell attacker activity will be logged in Event ID 4104"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-025",
+		Category:    "audit",
+		Severity:    models.SeverityMedium,
+		Title:       "PowerShell ScriptBlock logging disabled",
+		Description: "ScriptBlock logging is explicitly disabled. Post-exploitation tools (Empire, Covenant, manual PS) will leave no audit trail.",
+		Remediation: "Enable: reg add \"HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging\" /v EnableScriptBlockLogging /t REG_DWORD /d 1 /f",
+		Evidence:    []string{fmt.Sprintf("EnableScriptBlockLogging = %s (should be 1)", val)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkASRRules checks if Attack Surface Reduction rules are configured in Defender.
+func (s *Scanner) checkASRRules(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"(Get-MpPreference).AttackSurfaceReductionRules_Ids")
+	if err != nil || strings.TrimSpace(out) == "" {
+		return &models.Finding{
+			ID:          "WIN-026",
+			Category:    "antivirus",
+			Severity:    models.SeverityMedium,
+			Title:       "Attack Surface Reduction (ASR) rules not configured",
+			Description: "No ASR rules are active. ASR rules block common malware techniques: Office macros spawning child processes, credential theft from LSASS, ransomware behavior, and more.",
+			Remediation: "Enable key ASR rules via Defender: Set-MpPreference -AttackSurfaceReductionRules_Ids <GUID> -AttackSurfaceReductionRules_Actions Enabled. See Microsoft documentation for recommended rule GUIDs.",
+			Evidence:    []string{"No ASR rules configured"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	count := 0
+	for _, l := range lines {
+		if strings.TrimSpace(l) != "" {
+			count++
+		}
+	}
+	if count >= 5 {
+		return positiveAuditFinding("WIN-026-OK", "ASR rules configured ✓", fmt.Sprintf("%d ASR rules active", count), "Common malware techniques blocked by Defender"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-026",
+		Category:    "antivirus",
+		Severity:    models.SeverityLow,
+		Title:       fmt.Sprintf("Only %d ASR rules configured (recommend 5+)", count),
+		Description: "Few Attack Surface Reduction rules are active. More rules provide broader protection against macro malware, credential theft, and ransomware techniques.",
+		Remediation: "Add critical rules: Block Office apps from creating child processes, Block credential stealing from LSASS, Block executable content from email. See docs.microsoft.com/en-us/microsoft-365/security/defender-endpoint/attack-surface-reduction-rules-reference",
+		Evidence:    []string{fmt.Sprintf("%d ASR rules configured (Microsoft recommends 10+)", count)},
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkSpectreMeltdown checks that Spectre/Meltdown mitigations are enabled.
+func (s *Scanner) checkSpectreMeltdown(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management`, "/v", "FeatureSettingsOverride")
+	if err != nil {
+		// Key absent can mean mitigations are at OS-default (enabled on patched systems)
+		return positiveAuditFinding("WIN-027-OK", "Spectre/Meltdown mitigations at default ✓",
+			"FeatureSettingsOverride not explicitly set (OS defaults apply)",
+			"CPU vulnerability mitigations managed by Windows Update"), nil
+	}
+	val := extractRegDwordValue(out)
+	// FeatureSettingsOverride = 0 means mitigations enabled; 3 = disabled
+	if val == "0x0" || val == "0" {
+		return positiveAuditFinding("WIN-027-OK", "Spectre/Meltdown mitigations enabled ✓", "FeatureSettingsOverride = 0", "CPU vulnerability patches active"), nil
+	}
+	if val == "0x3" || val == "3" {
+		return &models.Finding{
+			ID:          "WIN-027",
+			Category:    "system",
+			Severity:    models.SeverityHigh,
+			Title:       "Spectre/Meltdown mitigations disabled",
+			Description: "CPU vulnerability mitigations have been explicitly disabled. The system is vulnerable to speculative execution attacks that can leak sensitive data from memory.",
+			Remediation: "Re-enable: reg add \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\" /v FeatureSettingsOverride /t REG_DWORD /d 0 /f && restart.",
+			Evidence:    []string{fmt.Sprintf("FeatureSettingsOverride = %s (3 = all mitigations disabled)", val)},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("WIN-027-OK", "Spectre/Meltdown mitigations active ✓",
+		fmt.Sprintf("FeatureSettingsOverride = %s", val), "Partial or full mitigations applied"), nil
+}
+
+// checkTelemetryLevel checks the Windows diagnostic data / telemetry level.
+func (s *Scanner) checkTelemetryLevel(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection`, "/v", "AllowTelemetry")
+	if err != nil {
+		// Try the non-policy key
+		out2, err2 := s.platform_util.RunCommand(ctx, "reg", "query",
+			`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection`, "/v", "AllowTelemetry")
+		if err2 != nil {
+			return &models.Finding{
+				ID:          "WIN-028",
+				Category:    "privacy",
+				Severity:    models.SeverityLow,
+				Title:       "Windows telemetry at default level",
+				Description: "Telemetry level is not explicitly configured. Windows may send enhanced diagnostic data including browsing history, app usage, and device activity to Microsoft.",
+				Remediation: "Reduce telemetry: Settings → Privacy & Security → Diagnostics & feedback → set to 'Required diagnostic data only'. Or: reg add HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection /v AllowTelemetry /t REG_DWORD /d 1 /f",
+				Evidence:    []string{"AllowTelemetry not explicitly configured"},
+				Timestamp:   time.Now(),
+			}, nil
+		}
+		out = out2
+	}
+	val := extractRegDwordValue(out)
+	// 0=Security (enterprise only), 1=Basic/Required, 2=Enhanced, 3=Full
+	switch val {
+	case "0x0", "0":
+		return positiveAuditFinding("WIN-028-OK", "Telemetry at Security level ✓", "AllowTelemetry = 0 (minimum)", "Only security-critical data sent"), nil
+	case "0x1", "1":
+		return positiveAuditFinding("WIN-028-OK", "Telemetry at Basic level ✓", "AllowTelemetry = 1 (Required)", "Minimal diagnostic data sent"), nil
+	case "0x3", "3":
+		return &models.Finding{
+			ID:          "WIN-028",
+			Category:    "privacy",
+			Severity:    models.SeverityLow,
+			Title:       "Windows telemetry set to Full",
+			Description: "Telemetry is at maximum level. Microsoft receives browsing data, ink/typing samples, app usage, and detailed device activity.",
+			Remediation: "Reduce: reg add HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DataCollection /v AllowTelemetry /t REG_DWORD /d 1 /f",
+			Evidence:    []string{fmt.Sprintf("AllowTelemetry = %s (Full)", val)},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	return positiveAuditFinding("WIN-028-OK", "Telemetry level acceptable ✓", fmt.Sprintf("AllowTelemetry = %s", val), "Diagnostic data level is controlled"), nil
+}
+
+// checkRegistryRunKeys audits Registry Run keys for unusual persistence entries.
+func (s *Scanner) checkRegistryRunKeys(ctx context.Context) (*models.Finding, error) {
+	// Check the 4 main Run key locations
+	locations := []string{
+		`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`,
+		`HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`,
+		`HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`,
+		`HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`,
+	}
+	var allEntries []string
+	var suspicious []string
+	for _, loc := range locations {
+		out, err := s.platform_util.RunCommand(ctx, "reg", "query", loc)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "HKEY") {
+				continue
+			}
+			allEntries = append(allEntries, line)
+			lower := strings.ToLower(line)
+			// Flag entries pointing to temp dirs, user-writable paths, or encoded commands
+			if strings.Contains(lower, "\\temp\\") ||
+				strings.Contains(lower, "\\tmp\\") ||
+				strings.Contains(lower, "appdata\\local\\temp") ||
+				strings.Contains(lower, "-encodedcommand") ||
+				strings.Contains(lower, "-enc ") ||
+				strings.Contains(lower, "powershell") && strings.Contains(lower, "-w hidden") ||
+				strings.Contains(lower, "mshta") ||
+				strings.Contains(lower, "wscript") ||
+				strings.Contains(lower, "cscript") {
+				suspicious = append(suspicious, line)
+			}
+		}
+	}
+	if len(suspicious) > 0 {
+		return &models.Finding{
+			ID:          "WIN-029",
+			Category:    "persistence",
+			Severity:    models.SeverityHigh,
+			Title:       fmt.Sprintf("Suspicious Registry Run key entries (%d found)", len(suspicious)),
+			Description: "Registry Run keys contain entries that match known persistence patterns (temp paths, encoded PowerShell, script hosts). These may indicate malware persistence.",
+			Remediation: "Review each entry: reg query HKCU\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run. Remove unknown entries. Scan with updated antivirus.",
+			Evidence:    suspicious,
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	evidence := fmt.Sprintf("%d total Run key entries, none suspicious", len(allEntries))
+	return positiveAuditFinding("WIN-029-OK", "Registry Run keys clean ✓", evidence, "No malware persistence patterns detected"), nil
+}
+
+// checkScheduledTasks audits scheduled tasks running as SYSTEM from non-standard locations.
+func (s *Scanner) checkScheduledTasks(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "powershell", "-NoProfile", "-NonInteractive", "-Command",
+		`Get-ScheduledTask | Where-Object { $_.Principal.UserId -like '*SYSTEM*' -and $_.State -eq 'Ready' } | ForEach-Object { $action = $_.Actions[0].Execute; if ($action -and $action -notlike 'C:\Windows\*' -and $action -notlike '%SystemRoot%\*' -and $action -ne $null) { "$($_.TaskName)|$action" } }`)
+	if err != nil {
+		return nil, nil
+	}
+	results := strings.TrimSpace(out)
+	if results == "" {
+		return positiveAuditFinding("WIN-030-OK", "Scheduled tasks clean ✓", "No SYSTEM tasks from non-standard paths", "No suspicious persistence via Task Scheduler"), nil
+	}
+	lines := strings.Split(results, "\n")
+	var evidence []string
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l != "" {
+			evidence = append(evidence, l)
+		}
+	}
+	if len(evidence) == 0 {
+		return positiveAuditFinding("WIN-030-OK", "Scheduled tasks clean ✓", "No SYSTEM tasks from non-standard paths", "No suspicious persistence via Task Scheduler"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-030",
+		Category:    "persistence",
+		Severity:    models.SeverityMedium,
+		Title:       fmt.Sprintf("SYSTEM scheduled tasks from non-standard paths (%d)", len(evidence)),
+		Description: "Scheduled tasks running as SYSTEM execute binaries from outside the Windows directory. These could be legitimate software or malware persistence.",
+		Remediation: "Review each task: schtasks /query /tn <TaskName> /v. Remove unknown tasks: schtasks /delete /tn <TaskName> /f",
+		Evidence:    evidence,
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkNetworkShares checks for non-default network shares.
+func (s *Scanner) checkNetworkShares(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "net", "share")
+	if err != nil {
+		return nil, nil
+	}
+	var nonDefault []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "Share name") || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "The command") {
+			continue
+		}
+		lower := strings.ToLower(line)
+		// Default shares: C$, D$, ADMIN$, IPC$, print$
+		if strings.HasPrefix(lower, "c$") || strings.HasPrefix(lower, "d$") ||
+			strings.HasPrefix(lower, "admin$") || strings.HasPrefix(lower, "ipc$") ||
+			strings.HasPrefix(lower, "print$") {
+			continue
+		}
+		if line != "" {
+			nonDefault = append(nonDefault, line)
+		}
+	}
+	if len(nonDefault) == 0 {
+		return positiveAuditFinding("WIN-031-OK", "No non-default network shares ✓", "Only default admin shares present", "No user data exposed via SMB shares"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-031",
+		Category:    "network",
+		Severity:    models.SeverityMedium,
+		Title:       fmt.Sprintf("Non-default network shares found (%d)", len(nonDefault)),
+		Description: "Custom network shares are configured. If permissions are misconfigured, sensitive data may be accessible to other network users or attackers.",
+		Remediation: "Review share permissions: net share <ShareName>. Remove unnecessary shares: net share <ShareName> /delete. Restrict access to authorized users only.",
+		Evidence:    nonDefault,
+		Timestamp:   time.Now(),
+	}, nil
+}
+
+// checkNullSession checks if anonymous/null session access is restricted.
+func (s *Scanner) checkNullSession(ctx context.Context) (*models.Finding, error) {
+	out, err := s.platform_util.RunCommand(ctx, "reg", "query",
+		`HKLM\SYSTEM\CurrentControlSet\Control\Lsa`, "/v", "RestrictAnonymous")
+	if err != nil {
+		return &models.Finding{
+			ID:          "WIN-032",
+			Category:    "network",
+			Severity:    models.SeverityMedium,
+			Title:       "Anonymous/null session restriction not configured",
+			Description: "RestrictAnonymous is not set. Anonymous users may be able to enumerate user accounts, shares, and other sensitive information without credentials.",
+			Remediation: "Restrict: reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa /v RestrictAnonymous /t REG_DWORD /d 1 /f (1=restrict, 2=deny all)",
+			Evidence:    []string{"RestrictAnonymous key not present"},
+			Timestamp:   time.Now(),
+		}, nil
+	}
+	val := extractRegDwordValue(out)
+	if val == "0x1" || val == "1" || val == "0x2" || val == "2" {
+		return positiveAuditFinding("WIN-032-OK", "Null session access restricted ✓", fmt.Sprintf("RestrictAnonymous = %s", val), "Anonymous enumeration of accounts/shares blocked"), nil
+	}
+	return &models.Finding{
+		ID:          "WIN-032",
+		Category:    "network",
+		Severity:    models.SeverityMedium,
+		Title:       "Anonymous/null session access not restricted",
+		Description: "RestrictAnonymous = 0 allows anonymous users to enumerate domain accounts, network shares, and group memberships without any credentials.",
+		Remediation: "Set: reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa /v RestrictAnonymous /t REG_DWORD /d 1 /f",
+		Evidence:    []string{fmt.Sprintf("RestrictAnonymous = %s (should be 1 or 2)", val)},
 		Timestamp:   time.Now(),
 	}, nil
 }

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -45,7 +46,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if os.Geteuid() != 0 {
+	if runtime.GOOS == "windows" {
+		// On Windows, check admin via net session (done inside platform layer)
+		// Show advisory instead of root check
+		fmt.Fprintf(os.Stderr, "Tip: run as Administrator for most accurate results.\n\n")
+	} else if os.Geteuid() != 0 {
 		fmt.Fprintf(os.Stderr, "Warning: not running as root. Some checks may be incomplete or inaccurate.\n\n")
 	}
 
@@ -156,8 +161,8 @@ Examples:
   vectorscan -output web -port 9090
 
 Notes:
-  - macOS and Linux supported
-  - Run with sudo for most accurate results
+  - macOS, Linux, and Windows supported
+  - Run with sudo/Administrator for most accurate results
   - Some checks may require elevated privileges
 `, version)
 }

@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"runtime"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/linkvectorized/vectorscan/pkg/models"
@@ -114,7 +113,7 @@ func Serve(report *models.Report, port int) error {
 
 	// Signal handler (Ctrl+C / kill)
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigChan, platformSignals()...)
 	go func() {
 		<-sigChan
 		stop()
@@ -145,7 +144,7 @@ func Serve(report *models.Report, port int) error {
 
 	// Detach from the controlling terminal so closing it doesn't kill the server.
 	// This creates a new session — the process is now independent of the shell.
-	syscall.Setsid() //nolint:errcheck
+	detachTerminal()
 
 	url := fmt.Sprintf("http://localhost:%d", port)
 	fmt.Fprintf(os.Stderr, "\n✓ Scan complete! Dashboard at %s\n", url)
@@ -182,7 +181,7 @@ func openBrowser(url string) {
 			cmd = exec.Command("xdg-open", url)
 		}
 	case "windows":
-		cmd = exec.Command("start", url)
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
 	default:
 		return
 	}
